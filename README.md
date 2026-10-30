@@ -470,7 +470,10 @@ Limitations:
 - Large tool schemas make the system prompt long, which costs context on every request.
 - `POST /v1/responses` is not covered: its `tools` are ignored.
 
-For requests with tools the proxy logs one
+To see what Venice actually sends for a model, set `VENICE_DUMP_UPSTREAM=<dir>`. Every
+`/api/inference/chat` request body, its response headers and the raw response bytes (before
+any parsing) are written to `<dir>`. Prompts are included, so keep `<dir>` outside the repo
+and use it for local debugging only. Independently, for requests with tools the proxy logs one
 `tool emulation: ignored upstream events …` line when Venice sent anything it does not use:
 other event kinds, non-JSON lines, or unexpected fields on content events.
 
