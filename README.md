@@ -586,6 +586,8 @@ To seed an existing session, copy `.venice-web-session.json` into `./venice-sess
 
 ## Logging
 
+To keep a copy of the log on disk, start the proxy with `npm run proxy:log` instead of `npm run proxy`. The output still shows in the terminal and is also written to `~/proxy.log` (`PROXY_LOG_FILE` to change it). The file is capped: past `LOG_MAX_BYTES` (default 10 MiB) it is renamed to `proxy.log.1`, older copies shift up, and only `LOG_KEEP` of them (default 3) are kept, so the logs take at most about 40 MiB. Rotation happens between lines.
+
 The proxy logs:
 
 - incoming request time

@@ -16,6 +16,7 @@
     "login:restore-only": "node ./scripts/login.mjs --restore-only",
     "poc": "node ./src/client.mjs",
     "proxy": "node ./src/proxy.mjs",
+    "proxy:log": "node ./src/proxy.mjs 2>&1 | node ./scripts/log-rotate.mjs \"${PROXY_LOG_FILE:-$HOME/proxy.log}\"",
     "start": "node ./index.mjs"
   },
   "dependencies": {
