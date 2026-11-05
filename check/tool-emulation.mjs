@@ -564,6 +564,111 @@ function testLoggedFixtures() {
 }
 
 // Qwen3-Coder / Qwen3.5+ XML calls: <function=NAME><parameter=KEY>VALUE…
+// GLM 5.2 on Venice drops the opening <arg_key> tags (and sometimes the
+// </arg_value><arg_key> between pairs). Shapes as seen in the proxy log, with
+// made-up content.
+function testGlmMissingKeyTags() {
+  section("GLM calls without <arg_key> tags");
+
+  const subagent = {
+    name: "subagent",
+    parameters: {
+      type: "object",
+      properties: { agent: { type: "string" }, description: { type: "string" }, prompt: { type: "string" } },
+      required: ["agent", "description", "prompt"],
+    },
+  };
+  const shell = {
+    name: "shell",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" }, description: { type: "string" }, timeout: { type: "number" } },
+      required: ["command"],
+    },
+  };
+  const write = {
+    name: "write",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" }, content: { type: "string" } },
+      required: ["path", "content"],
+    },
+  };
+  const tools = [subagent, shell, write];
+  const parse = (text, options) => {
+    const warnings = [];
+    const result = parseToolCalls(text, tools, { ...options, onWarning: (warning) => warnings.push(warning) });
+    return { ...result, warnings, args: result.toolCalls[0] ? args(result.toolCalls[0]) : null };
+  };
+  const streamed = (text) => {
+    const parser = createToolCallParser(tools);
+    const events = [];
+    for (const char of text) {
+      events.push(...parser.push(char));
+    }
+    events.push(...parser.end());
+    return events.filter((event) => event.type === "tool_call").map((event) => args(event.toolCall));
+  };
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+  const prompt = 'Read the task file and check:\n(1) the "summary" line;\n(2) git diff shows nothing else.';
+  const noTags =
+    "Fix applied. Starting verify.<tool_call>subagent\nagent</arg_key><arg_value>verify\n" +
+    `description</arg_key><arg_value>Verify the fix\nprompt</arg_key><arg_value>${prompt}</arg_value></tool_call>`;
+  const expected = { agent: "verify", description: "Verify the fix", prompt };
+  const parsed = parse(noTags);
+  ok("no <arg_key> and no </arg_value> between pairs: one call, exact args",
+    parsed.toolCalls.length === 1 && same(parsed.args, expected), JSON.stringify(parsed.args));
+  ok("text before the call kept", parsed.content === "Fix applied. Starting verify.");
+  ok("same result one character at a time", same(streamed(noTags), [expected]));
+
+  const firstOnly =
+    "<tool_call>subagent\nagent</arg_key><arg_value>verify</arg_value><arg_key>description</arg_key>" +
+    `<arg_value>Verify the fix</arg_value><arg_key>prompt</arg_key><arg_value>${prompt}</arg_value></tool_call>`;
+  ok("only the first <arg_key> missing (the retry's shape)", same(parse(firstOnly).args, expected));
+  const newlines =
+    "<tool_call>subagent\nagent</arg_key>\n<arg_value>verify</arg_value>\n<arg_key>description</arg_key>\n" +
+    `<arg_value>Verify the fix</arg_value>\n<arg_key>prompt</arg_key>\n<arg_value>${prompt}</arg_value>\n</tool_call>`;
+  ok("first <arg_key> missing, template newlines kept", same(parse(newlines).args, expected));
+  const closedNoOpen =
+    "<tool_call>subagent\nagent</arg_key><arg_value>verify</arg_value>\ndescription</arg_key><arg_value>Verify the fix</arg_value>\n" +
+    `prompt</arg_key><arg_value>${prompt}</arg_value></tool_call>`;
+  ok("</arg_value> present but no <arg_key> between pairs", same(parse(closedNoOpen).args, expected));
+
+  // A multi-line command whose lines include a parameter name: only a name
+  // followed by </arg_key> starts a new argument.
+  const script = "python3 - <<'EOF'\nimport json\ndescription\ntimeout = 5\nprint(json.dumps({'a': 1}))\nEOF";
+  const shellCall = parse(`Checking the counts.<tool_call>shell\ncommand</arg_key><arg_value>${script}</arg_value></tool_call>`);
+  ok("multi-line shell command kept whole", shellCall.toolCalls.length === 1 && shellCall.args?.command === script,
+    JSON.stringify(shellCall.args));
+  const withTimeout = parse(`<tool_call>shell\ncommand</arg_key><arg_value>${script}\ntimeout</arg_key><arg_value>120000</arg_value></tool_call>`);
+  ok("non-string value converted by schema", withTimeout.args?.command === script && withTimeout.args?.timeout === 120000,
+    JSON.stringify(withTimeout.args));
+  const crlf = parse("<tool_call>shell\r\ncommand</arg_key><arg_value>ls -la\r\ndescription</arg_key><arg_value>List files</arg_value></tool_call>");
+  ok("CRLF line breaks", crlf.args?.command === "ls -la" && crlf.args?.description === "List files", JSON.stringify(crlf.args));
+
+  const content = "line 1\n\n";
+  const writeCall = parse(`<tool_call>write\npath</arg_key><arg_value>/tmp/a.md\ncontent</arg_key><arg_value>${content}</arg_value></tool_call>`);
+  ok("trailing newlines of the last value kept", writeCall.args?.path === "/tmp/a.md" && writeCall.args?.content === content);
+  const literalTag = parse(
+    "<tool_call>write\npath</arg_key><arg_value>/tmp/doc.md\ncontent</arg_key><arg_value>Use <arg_key>KEY</arg_key> and\nKEY</arg_key> in templates.</arg_value></tool_call>");
+  ok("a tag inside a value does not start an argument unless it names a parameter",
+    literalTag.args?.content === "Use <arg_key>KEY</arg_key> and\nKEY</arg_key> in templates.", JSON.stringify(literalTag.args));
+
+  const unknownKey = parse("<tool_call>shell\ncmd</arg_key><arg_value>ls</arg_value></tool_call>");
+  ok("first key that is not a parameter: still unparsed",
+    unknownKey.toolCalls.length === 0 && /unrecognized arguments for "shell"/.test(unknownKey.warnings[0]?.reason ?? ""));
+  const missing = parse("<tool_call>subagent\nagent</arg_key><arg_value>verify\ndescription</arg_key><arg_value>Verify</arg_value></tool_call>");
+  ok("missing required argument still reported",
+    missing.toolCalls.length === 0 && /missing required argument "prompt"/.test(missing.warnings[0]?.reason ?? ""));
+  const noValueTag = parse("<tool_call>shell\ncommand</arg_key>ls</tool_call>");
+  ok("key without <arg_value>: unparsed", noValueTag.toolCalls.length === 0);
+  const cut = parse("<tool_call>write\npath</arg_key><arg_value>/tmp/a.md\ncontent</arg_key><arg_value>half of the fi");
+  ok("stream cut mid-value: not a call", cut.toolCalls.length === 0 && /"content" for "write" was cut off/.test(cut.warnings[0]?.reason ?? ""));
+  const cutAfter = parse("<tool_call>write\npath</arg_key><arg_value>/tmp/a.md\ncontent</arg_key><arg_value>done</arg_value>");
+  ok("stream cut after the last </arg_value>: accepted", cutAfter.args?.content === "done");
+}
+
 function testQwenXml() {
   section("qwen XML format (Qwen3-Coder, Qwen3.5+)");
 
@@ -1516,6 +1621,7 @@ async function main() {
   testHistory();
   testFormats();
   testLoggedFixtures();
+  testGlmMissingKeyTags();
   testQwenXml();
   testProxyFormat();
   testDollarPatterns();

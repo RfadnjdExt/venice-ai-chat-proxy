@@ -898,6 +898,61 @@ function parseHybridArgs(tool, text) {
   return buildToolCall(tool, parsed.value);
 }
 
+// GLM 5.2 on Venice often drops the opening <arg_key> tags:
+//   <tool_call>NAME\nKEY</arg_key><arg_value>VALUE\nKEY2</arg_key><arg_value>VALUE2</arg_value></tool_call>
+// (the first <arg_key> always, sometimes also the </arg_value><arg_key>
+// between pairs). A key is accepted only where a "</arg_key>" follows a
+// parameter name of this tool that starts a line or comes right after
+// <arg_key>, so a multi-line value is never split at an ordinary line. The
+// pairs are rewritten in the regular form and parsed as usual, which keeps
+// the type conversion and the cut-off check for the last value.
+function parseGlmArgsWithoutKeyTags(tool, rest, terminated) {
+  const properties = isPlainObject(tool.parameters?.properties) ? tool.parameters.properties : null;
+  const isKey = (key) =>
+    properties ? Object.hasOwn(properties, key) : /^[A-Za-z_][\w.-]*$/.test(key);
+  const unrecognized = { error: `unrecognized arguments for "${tool.name}"` };
+
+  const first = /^([^\s<>{}"]+)<\/arg_key>/.exec(rest);
+  if (!first || !isKey(first[1])) {
+    return unrecognized;
+  }
+  const used = new Set([first[1]]);
+  let key = first[1];
+  let pos = first[0].length;
+  let regular = "";
+  for (;;) {
+    const valueTag = /^\s*<arg_value>/.exec(rest.slice(pos));
+    if (!valueTag) {
+      return unrecognized;
+    }
+    pos += valueTag[0].length;
+
+    let next = null;
+    for (let at = rest.indexOf("</arg_key>", pos); at >= 0; at = rest.indexOf("</arg_key>", at + 1)) {
+      const before = /(?:<arg_key>|\r?\n)([^\s<>]+)$/.exec(rest.slice(pos, at));
+      if (before && isKey(before[1]) && !used.has(before[1])) {
+        next = { key: before[1], keyStart: pos + before.index, end: at + "</arg_key>".length };
+        break;
+      }
+    }
+    if (!next) {
+      // Last pair: kept raw, so a value cut off by the end of the stream is
+      // still reported as such.
+      regular += `<arg_key>${key}</arg_key><arg_value>${rest.slice(pos)}`;
+      break;
+    }
+    // The value runs to the line break before the next key, which is markup
+    // and not part of it; a </arg_value> the model did write ends it earlier
+    // (ARG_PAIR_RE stops at the first one).
+    const value = rest.slice(pos, next.keyStart);
+    regular += `<arg_key>${key}</arg_key><arg_value>${value}</arg_value>`;
+    used.add(next.key);
+    key = next.key;
+    pos = next.end;
+  }
+  return parseKeyValueArgs(tool, regular, { pattern: ARG_PAIR_RE, terminated });
+}
+
 // Whatever follows the tool name: GLM pairs, Qwen parameters, a JSON object,
 // or a hybrid of a key tag and JSON.
 function parseCallArguments(tool, rest, terminated) {
@@ -918,6 +973,9 @@ function parseCallArguments(tool, rest, terminated) {
     return parameter[1].includes('"')
       ? parseHybridArgs(tool, rest.slice(rest.indexOf("=") + 1))
       : parseKeyValueArgs(tool, rest, { pattern: QWEN_PARAM_RE, trim: trimWrappingNewlines, terminated });
+  }
+  if (/^[^\s<>{}"]+<\/arg_key>/.test(rest)) {
+    return parseGlmArgsWithoutKeyTags(tool, rest, terminated);
   }
   return { error: `unrecognized arguments for "${tool.name}"` };
 }
