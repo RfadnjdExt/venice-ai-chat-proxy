@@ -855,6 +855,10 @@ export class VeniceWebClient {
       webScrapeEnabled: Boolean(options.webScrapeEnabled),
       xSearchEnabled: Boolean(options.xSearchEnabled),
     };
+    // The web app's per-request opt-in to the model's full context.
+    if (options.enableLargeContextChat === true) {
+      requestBody.enableLargeContextChat = true;
+    }
     if (typeof options.temperature === "number") {
       requestBody.temperature = options.temperature;
     }
@@ -919,6 +923,10 @@ export class VeniceWebClient {
       webScrapeEnabled: Boolean(options.webScrapeEnabled),
       xSearchEnabled: Boolean(options.xSearchEnabled),
     };
+    // The web app's per-request opt-in to the model's full context.
+    if (options.enableLargeContextChat === true) {
+      requestBody.enableLargeContextChat = true;
+    }
     if (typeof options.temperature === "number") {
       requestBody.temperature = options.temperature;
     }

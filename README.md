@@ -173,6 +173,23 @@ translate model="aion-labs-aion-3-0-mini" venice_model=aion-labs-aion-3-0-mini r
 
 If the catalog can't be fetched at startup the proxy logs a warning and still serves; requests then fall back to Venice's own server-side defaults until the next `/v1/models` call.
 
+### Context size, usage and "prompt too long"
+
+Venice's chat endpoint can refuse a long conversation with `HTTP 413 {"error":"userPromptTooLong"}` (seen with an opencode session of about 820 KB on GLM 5.2). What exactly triggers it is not known yet: in a live test on 2026-11-05 the endpoint accepted a single ~200K-token message (1.2 MB) on GLM 5.2 and a ~60K-token one on `qwen3-coder-480b-a35b-instruct-turbo`, so it is not a plain 50K-token cap.
+
+What the proxy does about it:
+
+- **Estimated usage.** Venice reports no token counts, so the proxy estimates them (UTF-8 bytes / 3.5) and returns `usage` on every `/v1/chat/completions` response: in the JSON body, or on the final `choices: []` chunk of a stream. `prompt_tokens` counts what is actually sent to Venice, including the tool prompt; `completion_tokens` counts answer text plus reasoning. Clients such as opencode use it to decide when to compact a conversation. The estimate errs high: about 1.75× the real count for plain English prose, closer for code and JSON, so clients compact early rather than late. The translate log shows `est_prompt_tokens=N`.
+- **Overflow as a 400.** A 413 `userPromptTooLong` / `userMessageTooLong` from Venice comes back as HTTP 400 with `code: "context_length_exceeded"` and a message starting `prompt is too long`, the shape OpenAI-compatible clients treat as a context overflow (opencode then compacts and retries) instead of a server error.
+- **Large context opt-in.** Like the web app, the chat request carries `enableLargeContextChat: true` for a model the catalog marks as `largeContextChatEligible` (at the time of writing GLM 5.2 and `qwen-3-8-27b`) and that does not bill credits (`usesCredits`); the translate log shows `large_context=on`. Without it, the web client limits a prompt to 50K or 25K tokens on its own side. `VENICE_LARGE_CONTEXT=off` stops sending it.
+
+Clients still need a context limit to compact against. In opencode, give each model a `limit`, for example:
+
+```json
+"zai-org-glm-5-2": { "limit": { "context": 200000, "output": 32768 } },
+"qwen3-coder-480b-a35b-instruct-turbo": { "limit": { "context": 120000, "output": 8192 } }
+```
+
 ### HTTP transport
 
 Cloudflare rejects plain Node `fetch` on the Venice inference endpoints (`POST /api/inference/chat` returns a 403 challenge page), so the client sends every request through a `wreq-js` session with a Chrome TLS/HTTP fingerprint. Set `VENICE_HTTP_TRANSPORT=fetch` to force the old plain-fetch transport for debugging, and `VENICE_WREQ_BROWSER` / `VENICE_WREQ_OS` to change the impersonated profile (defaults: `chrome_131`, `macos`).
@@ -579,6 +596,7 @@ The proxy logs:
 - `content_chars`
 - `reasoning_chars`
 - `tools` and `tool_calls` counts for requests that used tool emulation, plus `tool_attempts=2` when a call was retried (the translate line also shows `tools`, `tool_choice` and `tool_format`)
+- on the translate line, `est_prompt_tokens` (the estimated prompt size sent to Venice) and `large_context=on` when the request opted in to the model's full context
 - total request duration
 - stream duration for streaming completions
 

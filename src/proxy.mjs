@@ -15,6 +15,7 @@ import {
   truncateSnippet,
 } from "./tool-emulation.mjs";
 import { replaceNullBytes } from "./venice-text.mjs";
+import { buildUsage, contextOverflowError, createTokenCounter, estimatePromptTokens } from "./context.mjs";
 
 const PORT = Number(process.env.PORT || process.env.VENICE_PROXY_PORT || 3456);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -40,6 +41,16 @@ const TOOL_FORMAT_RULES = parseToolFormatRules(process.env.VENICE_TOOL_FORMATS);
 // starts (0 = no limit). The longest successful run seen live reasoned for
 // 16.5K characters; a runaway one hit 161K and the 5-minute upstream timeout.
 const TOOL_REASONING_BUDGET = parseReasoningBudget(process.env.VENICE_TOOL_REASONING_BUDGET);
+// Venice's web app sends enableLargeContextChat ("Large Context Chat") to get a
+// model's full context; without it the web client's own prompt limit is 50K or
+// 25K tokens (from its JS bundle). Only models with largeContextChatEligible in
+// the catalog take it. Live, the chat endpoint took a ~200K-token prompt on
+// GLM 5.2 with and without the flag (2026-11-05), so it mirrors the web app
+// rather than fixing a known limit. "off" never sends it; models that bill
+// credits never get it.
+const LARGE_CONTEXT_ENABLED = !["off", "0", "false", "no"].includes(
+  process.env.VENICE_LARGE_CONTEXT?.trim().toLowerCase() ?? "",
+);
 // Forced off (with includeVeniceSystemPrompt) whenever tools are emulated.
 const TOOL_EMULATION_DISABLED_FEATURES = ["webEnabled", "webScrapeEnabled", "xSearchEnabled"];
 if (TOOL_FORMAT_RULES.invalid.length > 0) {
@@ -188,6 +199,19 @@ function collectStreamLengths(events) {
   }
 
   return { contentLength, reasoningLength };
+}
+
+// Estimated completion size of a collected Venice reply: answer text plus
+// reasoning, which also takes up the model's output budget.
+function estimateCompletionTokens(events) {
+  const counter = createTokenCounter();
+  for (const event of Array.isArray(events) ? events : []) {
+    if (event?.kind === "content") {
+      counter.add(event.content);
+      counter.add(event.reasoning_content);
+    }
+  }
+  return counter.tokens;
 }
 
 function getRequestOrigin(req) {
@@ -423,6 +447,7 @@ function buildChatCompletionResponse({
   text,
   created,
   toolCalls = [],
+  usage = null,
 }) {
   const message = {
     role: "assistant",
@@ -431,7 +456,7 @@ function buildChatCompletionResponse({
   if (toolCalls.length > 0) {
     message.tool_calls = toolCalls;
   }
-  return {
+  const response = {
     id: completionId || `chatcmpl_${created}`,
     object: "chat.completion",
     created,
@@ -444,6 +469,10 @@ function buildChatCompletionResponse({
       },
     ],
   };
+  if (usage) {
+    response.usage = usage;
+  }
+  return response;
 }
 
 function writeSseChunk(res, data) {
@@ -736,6 +765,10 @@ function logRequestTranslation({
   if (nullBytesReplaced > 0) {
     parts.push(`null_bytes_replaced=${nullBytesReplaced}`);
   }
+  if (options.enableLargeContextChat) {
+    parts.push("large_context=on");
+  }
+  parts.push(`est_prompt_tokens=${estimatePromptTokens(options.promptMessages, options.systemPrompt)}`);
   parts.push(`messages=${Array.isArray(options.promptMessages) ? options.promptMessages.length : 0}`);
   parts.push(`system_chars=${getTextLength(options.systemPrompt)}`);
   if (options.requestId) {
@@ -801,15 +834,18 @@ function buildVeniceChatOptions({
     veniceSystemPromptSource = "tools";
   }
 
-  const sampling = resolveSampling(
-    payload,
-    resolveModelSettings?.(parsedModel.model) ?? null,
-  );
+  const catalogEntry = resolveModelSettings?.(parsedModel.model) ?? null;
+  const sampling = resolveSampling(payload, catalogEntry);
   if (sampling.temperature) {
     options.temperature = sampling.temperature.value;
   }
   if (sampling.topP) {
     options.topP = sampling.topP.value;
+  }
+  // Opt in to the model's full context like the web app does, for eligible
+  // models that do not bill credits (see LARGE_CONTEXT_ENABLED).
+  if (LARGE_CONTEXT_ENABLED && catalogEntry?.largeContextChatEligible === true && catalogEntry.usesCredits !== true) {
+    options.enableLargeContextChat = true;
   }
 
   logRequestTranslation({
@@ -979,6 +1015,12 @@ class VeniceOpenAiProxy {
       if (typeof model?.settings?.topP === "number") {
         entry.topP = model.settings.topP;
       }
+      if (typeof model?.largeContextChatEligible === "boolean") {
+        entry.largeContextChatEligible = model.largeContextChatEligible;
+      }
+      if (typeof model?.usesCredits === "boolean") {
+        entry.usesCredits = model.usesCredits;
+      }
       if (Object.keys(entry).length === 0) {
         continue;
       }
@@ -1024,7 +1066,7 @@ class VeniceOpenAiProxy {
   async refreshModelSettings() {
     await this.fetchTextModels();
     console.log(
-      `[${nowIso()}] model catalog loaded: ${this.modelSettings.size} sampling defaults cached`,
+      `[${nowIso()}] model catalog loaded: ${this.modelSettings.size} model settings cached (sampling defaults, large-context flags)`,
     );
     return this.modelSettings;
   }
@@ -1084,18 +1126,16 @@ class VeniceOpenAiProxy {
     return await this.callWithAuth(
       async (auth) => {
         const requestId = Math.random().toString(36).slice(2, 9);
-        return await this.client.chat(
-          auth.login.clerkJwt,
-          undefined,
-          buildVeniceChatOptions({
-            payload,
-            model,
-            prompt,
-            systemPrompt,
-            requestId,
-            resolveModelSettings: (id) => this.getModelSettings(id),
-          }),
-        );
+        const options = buildVeniceChatOptions({
+          payload,
+          model,
+          prompt,
+          systemPrompt,
+          requestId,
+          resolveModelSettings: (id) => this.getModelSettings(id),
+        });
+        const result = await this.client.chat(auth.login.clerkJwt, undefined, options);
+        return { ...result, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
       },
       { label: "chat completion", model },
     );
@@ -1111,19 +1151,17 @@ class VeniceOpenAiProxy {
     return await this.callWithAuth(
       async (auth) => {
         const requestId = Math.random().toString(36).slice(2, 9);
-        return await this.client.openChatStream(
-          auth.login.clerkJwt,
-          undefined,
-          buildVeniceChatOptions({
-            payload,
-            model,
-            prompt,
-            systemPrompt,
-            requestId,
-            resolveModelSettings: (id) => this.getModelSettings(id),
-            toolEmulation,
-          }),
-        );
+        const options = buildVeniceChatOptions({
+          payload,
+          model,
+          prompt,
+          systemPrompt,
+          requestId,
+          resolveModelSettings: (id) => this.getModelSettings(id),
+          toolEmulation,
+        });
+        const stream = await this.client.openChatStream(auth.login.clerkJwt, undefined, options);
+        return { ...stream, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
       },
       { label: "chat completion stream", model },
     );
@@ -1138,6 +1176,9 @@ export function createVeniceOpenAiProxy() {
 async function* chatAttemptEvents(proxy, payload, toolEmulation, messages, stats) {
   const created = Math.floor(Date.now() / 1000);
   const stream = await proxy.openChatCompletionStream(payload, { ...toolEmulation, messages });
+  // The usage reported is that of the attempt the reply came from.
+  stats.promptTokens = stream.promptTokens;
+  stats.completion = createTokenCounter();
   // What the proxy drops on the floor: other event kinds, non-JSON lines, and
   // unexpected fields on content events. Logged once, so a model whose tool
   // calls never show up as content can be diagnosed without a full dump.
@@ -1170,6 +1211,10 @@ async function* chatAttemptEvents(proxy, payload, toolEmulation, messages, stats
 // One upstream chat event as runToolEmulation events.
 function* normalizeChatEvent(event, stats, created) {
   updateStreamStats(stats, event);
+  if (event?.kind === "content") {
+    stats.completion?.add(event.content);
+    stats.completion?.add(event.reasoning_content);
+  }
   debugLog("venice:event", event);
   if (event?.kind === "meta") {
     yield {
@@ -1228,6 +1273,7 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
     completionId = event.completionId ?? completionId;
     model = event.model ?? model;
   };
+  const usage = () => buildUsage(stats.promptTokens, stats.completion?.tokens);
 
   if (!payload.stream) {
     let text = "";
@@ -1269,6 +1315,7 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
       text: toolCalls.length > 0 ? text.trim() || null : text,
       created,
       toolCalls,
+      usage: usage(),
     });
     if (reasoning) {
       response.choices[0].message.reasoning_content = reasoning;
@@ -1376,7 +1423,7 @@ async function respondWithToolEmulation({ req, res, url, startedAt, proxy, paylo
       finishChunk.venice_tool_attempts = runStats.attempts;
     }
     writeSseChunk(res, finishChunk);
-    writeSseChunk(res, { id: completionId, object: "chat.completion.chunk", created, model, choices: [], usage: null });
+    writeSseChunk(res, { id: completionId, object: "chat.completion.chunk", created, model, choices: [], usage: usage() });
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (error) {
@@ -1639,6 +1686,10 @@ export function createVeniceOpenAiProxyServer(
           );
           const created = Math.floor(Date.now() / 1000);
           let completionId = `chatcmpl_${created}`;
+          // The agent session builds its own prompt; the client's messages are
+          // the closest estimate. Output counts the text the client receives.
+          const promptTokens = estimatePromptTokens(payload.messages);
+          const completion = createTokenCounter();
           // Track which output_index holds reasoning vs message content
           const itemTypes = {}; // output_index -> item type string
 
@@ -1683,6 +1734,7 @@ export function createVeniceOpenAiProxyServer(
                   } else {
                     contentLength += delta.length;
                   }
+                  completion.add(delta);
 
                   const deltaObj = firstDeltaSent
                     ? (isReasoning
@@ -1772,7 +1824,7 @@ export function createVeniceOpenAiProxyServer(
                 created,
                 model: agentModelId,
                 choices: [],
-                usage: null,
+                usage: buildUsage(promptTokens, completion.tokens),
               });
               res.write("data: [DONE]\n\n");
               res.end();
@@ -1805,6 +1857,7 @@ export function createVeniceOpenAiProxyServer(
                 itemTypes[data?.output_index ?? 0] = data?.item?.type ?? "message";
               }
               if (event === "response.output_text.delta" && typeof data?.delta === "string") {
+                completion.add(data.delta);
                 const idx = data?.output_index ?? 0;
                 if (itemTypes[idx] === "reasoning") {
                   fullReasoning += data.delta;
@@ -1840,6 +1893,7 @@ export function createVeniceOpenAiProxyServer(
             created,
             model: agentModelId,
             choices: [{ index: 0, finish_reason: "stop", message }],
+            usage: buildUsage(promptTokens, completion.tokens),
           });
           logOutgoingResponse({ req, url, status: 200, model: agentModelId, contentLength: fullContent.length, reasoningLength: fullReasoning.length, durationMs: Date.now() - startedAt });
           return;
@@ -1854,6 +1908,7 @@ export function createVeniceOpenAiProxyServer(
           let firstDeltaSent = false;
           const stats = createStreamStats();
           const stream = await proxy.openChatCompletionStream(payload);
+          const completion = createTokenCounter();
 
           res.writeHead(200, {
             "content-type": "text/event-stream; charset=utf-8",
@@ -1864,6 +1919,10 @@ export function createVeniceOpenAiProxyServer(
           try {
             for await (const event of stream.events) {
               updateStreamStats(stats, event);
+              if (event?.kind === "content") {
+                completion.add(event.content);
+                completion.add(event.reasoning_content);
+              }
               debugLog("venice:event", event);
 
               if (
@@ -1962,7 +2021,7 @@ export function createVeniceOpenAiProxyServer(
             writeSseChunk(res, {
               choices: [],
               object: "chat.completion.chunk",
-              usage: null,
+              usage: buildUsage(stream.promptTokens, completion.tokens),
               created,
               model: servingModelId,
               id: completionId,
@@ -2021,6 +2080,7 @@ export function createVeniceOpenAiProxyServer(
             completionId,
             text: result.text,
             created,
+            usage: buildUsage(result.promptTokens, estimateCompletionTokens(result.events)),
           }),
         );
         logOutgoingResponse({
@@ -2054,6 +2114,13 @@ export function createVeniceOpenAiProxyServer(
         if (!res.writableEnded) {
           res.end();
         }
+        return;
+      }
+      const overflow = contextOverflowError(error);
+      if (overflow) {
+        console.warn(`[${nowIso()}] context overflow: ${error instanceof Error ? error.message : String(error)}`);
+        json(res, overflow.status, overflow.body);
+        logOutgoingResponse({ req, url, status: overflow.status, durationMs: Date.now() - startedAt });
         return;
       }
       json(res, 500, {
