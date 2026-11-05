@@ -587,6 +587,7 @@ The proxy logs:
 - Clerk JWTs are short-lived; the session file is important because it persists cookies needed for restore.
 - The proxy does not perform interactive login during requests.
 - Venice's chat endpoint keeps only the last of several same-role messages in a row, so `/v1/chat/completions` merges adjacent user (or assistant) messages into one turn, separated by a blank line. Tool results count as assistant turns, as before.
+- Venice rejects any request containing a null byte (`String must not contain null bytes`), and tool output such as `find -print0` or a binary file can carry them. The proxy replaces null bytes with `�` (U+FFFD) in everything it sends to Venice, on every endpoint; the translate log line shows `null_bytes_replaced=N` when it did.
 - For container startup, login/restore happens once before the server starts.
 
 ## Troubleshooting

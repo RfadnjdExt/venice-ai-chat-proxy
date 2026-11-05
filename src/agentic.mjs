@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { replaceNullBytes } from "./venice-text.mjs";
 
 const DEFAULT_AGENTIC_MODEL = "kimi-k2-5";
 // Models only the chat/agents/venice endpoint serves; requested by their own id.
@@ -161,7 +162,8 @@ export function convertToWorkflowMessages(openAiMessages) {
       });
     }
   }
-  return result;
+  // Venice rejects null bytes anywhere in the request; see venice-text.mjs.
+  return replaceNullBytes(result);
 }
 
 export class AgenticProxy {
@@ -367,5 +369,5 @@ function buildNextTurnItems(outputItems, itemTexts) {
     result.push(item);
   }
 
-  return result;
+  return replaceNullBytes(result);
 }
