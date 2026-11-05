@@ -357,6 +357,7 @@ The proxy logs:
 - Fresh login is browserless, but it depends on `wreq-js` Chrome impersonation because Clerk currently rejects plain Node/curl HTTP fingerprints with 429s.
 - Clerk JWTs are short-lived; the session file is important because it persists cookies needed for restore.
 - The proxy does not perform interactive login during requests.
+- Venice rejects any request containing a null byte (`String must not contain null bytes`), and tool output such as `find -print0` or a binary file can carry them. The proxy replaces null bytes with `�` (U+FFFD) in everything it sends to Venice, on every endpoint; the translate log line shows `null_bytes_replaced=N` when it did.
 - For container startup, login/restore happens once before the server starts.
 
 ## Troubleshooting

@@ -3,6 +3,7 @@ import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { VeniceWebClient, decodeJwtPayload } from "./client.mjs";
 import { AgenticProxy } from "./agentic.mjs";
+import { replaceNullBytes } from "./venice-text.mjs";
 
 const PORT = Number(process.env.PORT || process.env.VENICE_PROXY_PORT || 3456);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -667,6 +668,7 @@ function logRequestTranslation({
   noThinkApplied,
   sampling,
   veniceSystemPromptSource,
+  nullBytesReplaced = 0,
 }) {
   const parts = [
     `model=${JSON.stringify(requestedModel ?? "")}`,
@@ -683,6 +685,9 @@ function logRequestTranslation({
   }
   if (typeof options.topP === "number") {
     parts.push(`top_p=${options.topP}(${sampling?.topP?.source ?? "request"})`);
+  }
+  if (nullBytesReplaced > 0) {
+    parts.push(`null_bytes_replaced=${nullBytesReplaced}`);
   }
   parts.push(`messages=${Array.isArray(options.promptMessages) ? options.promptMessages.length : 0}`);
   parts.push(`system_chars=${getTextLength(options.systemPrompt)}`);
@@ -713,10 +718,12 @@ function buildVeniceChatOptions({
           message.content.startsWith("/no_think "),
       )
     : false;
+  // Venice rejects null bytes anywhere in the prompt; see venice-text.mjs.
+  const nullBytes = { replaced: 0 };
   const options = {
     model: parsedModel.model,
-    promptMessages,
-    systemPrompt,
+    promptMessages: replaceNullBytes(promptMessages, nullBytes),
+    systemPrompt: replaceNullBytes(systemPrompt, nullBytes),
     requestId,
     reasoning,
     ...parsedModel.features,
@@ -747,6 +754,7 @@ function buildVeniceChatOptions({
     noThinkApplied,
     sampling,
     veniceSystemPromptSource: veniceSystemPromptFromSuffix ? "suffix" : "default",
+    nullBytesReplaced: nullBytes.replaced,
   });
 
   return options;

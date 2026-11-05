@@ -2,6 +2,7 @@
   "scripts": {
     "check:concurrency": "node ./check/concurrency.mjs",
     "check:models": "node ./check/models.mjs",
+    "check:null-bytes": "node ./check/null-bytes.mjs",
     "check:openai-client": "node ./check/openai.mjs",
     "clean-session": "node ./scripts/login.mjs --clean-session",
     "convert:chat": "node ./scripts/convert.mjs",
