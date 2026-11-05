@@ -160,7 +160,37 @@ export async function* parseSseStream(stream) {
   }
 }
 
-export async function* parseJsonLineStream(stream) {
+// VENICE_DUMP_UPSTREAM=<dir> writes every /api/inference/chat request body,
+// response headers and raw response bytes to <dir>, to see exactly what Venice
+// sends (prompts included: local debugging only).
+const DUMP_UPSTREAM_DIR = process.env.VENICE_DUMP_UPSTREAM?.trim() || null;
+
+function startUpstreamDump(requestBody, response) {
+  if (!DUMP_UPSTREAM_DIR) {
+    return null;
+  }
+  fs.mkdirSync(DUMP_UPSTREAM_DIR, { recursive: true });
+  // modelId comes from the caller's "model" field: keep it to one plain
+  // filename part so it cannot point outside the dump directory.
+  const safe = (value) => String(value).replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_");
+  const dir = path.resolve(DUMP_UPSTREAM_DIR);
+  const base = path.join(
+    dir,
+    `${new Date().toISOString().replace(/[:.]/g, "-")}-${safe(requestBody.modelId)}-${safe(requestBody.requestId)}`,
+  );
+  if (path.dirname(base) !== dir) {
+    return null;
+  }
+  fs.writeFileSync(`${base}.request.json`, JSON.stringify(requestBody, null, 2));
+  fs.writeFileSync(
+    `${base}.response-headers.json`,
+    JSON.stringify({ status: response.status, headers: Object.fromEntries(response.headers.entries()) }, null, 2),
+  );
+  process.stderr.write(`[upstream-dump] ${base}.*\n`);
+  return (text) => fs.appendFileSync(`${base}.response.txt`, text);
+}
+
+export async function* parseJsonLineStream(stream, { onText = null } = {}) {
   if (!stream) {
     return;
   }
@@ -180,7 +210,9 @@ export async function* parseJsonLineStream(stream) {
         break;
       }
 
-      buffer += decoder.decode(value, { stream: true });
+      const text = decoder.decode(value, { stream: true });
+      onText?.(text);
+      buffer += text;
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() ?? "";
 
@@ -843,6 +875,7 @@ export class VeniceWebClient {
     });
 
     const text = await response.text();
+    startUpstreamDump(requestBody, response)?.(text);
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${text}`);
     }
@@ -905,14 +938,16 @@ export class VeniceWebClient {
       body: JSON.stringify(requestBody),
     });
 
+    const dump = startUpstreamDump(requestBody, response);
     if (!response.ok) {
       const text = await response.text();
+      dump?.(text);
       throw new Error(`HTTP ${response.status}: ${text}`);
     }
 
     return {
       response,
-      events: parseJsonLineStream(response.body),
+      events: parseJsonLineStream(response.body, { onText: dump }),
     };
   }
 

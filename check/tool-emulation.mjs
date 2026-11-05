@@ -1,3 +1,7 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   buildToolCallDeltas,
@@ -1000,6 +1004,46 @@ async function testRunToolEmulation() {
     meta.events.filter((event) => event.type === "meta").map((event) => event.completionId).join() === "first");
 }
 
+async function testUpstreamDump() {
+  section("VENICE_DUMP_UPSTREAM");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "venice-dump-check-"));
+  // The flag is read at import time, so check it in a child process.
+  const script = `
+    import { VeniceWebClient } from ${JSON.stringify(new URL("../src/client.mjs", import.meta.url).href)};
+    const client = new VeniceWebClient({ transport: "fetch" });
+    client.request = async () => new Response('{"kind":"content","content":"a"}\\n{"kind":"toolCall"}\\n', {
+      status: 200, headers: { "content-type": "application/x-ndjson" },
+    });
+    const stream = await client.openChatStream("jwt", undefined, { model: "m1", requestId: "r1", promptMessages: [{ role: "user", content: "hi" }] });
+    for await (const _event of stream.events) {}
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, VENICE_DUMP_UPSTREAM: dir },
+    encoding: "utf8",
+  });
+  const files = fs.readdirSync(dir).sort();
+  const read = (suffix) => fs.readFileSync(path.join(dir, files.find((file) => file.endsWith(suffix))), "utf8");
+  ok("dump writes request, headers and raw response", result.status === 0 && files.length === 3, result.stderr || files.join());
+  if (files.length === 3) {
+    ok("request body dumped", JSON.parse(read(".request.json")).modelId === "m1");
+    ok("response headers dumped", JSON.parse(read(".response-headers.json")).headers["content-type"] === "application/x-ndjson");
+    ok("raw response bytes dumped", read(".response.txt") === '{"kind":"content","content":"a"}\n{"kind":"toolCall"}\n');
+  }
+
+  // The model id comes from the client: it must not escape the dump directory.
+  const outside = path.join(path.dirname(dir), `escaped-${path.basename(dir)}`);
+  const hostile = script.replace('model: "m1"', `model: ${JSON.stringify(`../${path.basename(outside)}/x`)}`);
+  const hostileRun = spawnSync(process.execPath, ["--input-type=module", "-e", hostile], {
+    env: { ...process.env, VENICE_DUMP_UPSTREAM: dir },
+    encoding: "utf8",
+  });
+  ok("hostile model id stays inside the dump directory",
+    hostileRun.status === 0 && !fs.existsSync(outside) &&
+      fs.readdirSync(dir).some((file) => file.includes(`__escaped-${path.basename(dir)}_x`)), hostileRun.stderr);
+  fs.rmSync(outside, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 async function testReasoningBudget() {
   section("reasoning budget");
 
@@ -1482,6 +1526,7 @@ async function main() {
   await testReasoningBudget();
   await testEmptyReplies();
   await testStreamCancellation();
+  await testUpstreamDump();
   await testProxyWiring();
 
   console.log(`\n${"─".repeat(40)}`);
