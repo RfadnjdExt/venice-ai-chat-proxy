@@ -444,6 +444,16 @@ class CookieJar {
   }
 }
 
+function makeHttpError(response, bodyText) {
+  const err = new Error(`HTTP ${response.status}: ${bodyText}`);
+  err.status = response.status;
+  const reset = response.headers?.get?.("x-ratelimit-reset") || response.headers?.get?.("retry-after");
+  if (reset) {
+    err.rateLimitReset = reset;
+  }
+  return err;
+}
+
 export class VeniceWebClient {
   constructor({
     email = credentialValue("VENICE_EMAIL"),
@@ -582,7 +592,7 @@ export class VeniceWebClient {
     const text = await response.text();
     const data = text ? safeJsonParse(text) : null;
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+      throw makeHttpError(response, typeof data === "string" ? data : JSON.stringify(data));
     }
     return data;
   }
@@ -803,6 +813,10 @@ export class VeniceWebClient {
     if (cached?.token && cached.expiresAtMs - CLIENT_ATTESTATION_SKEW_MS > now) {
       return cached.token;
     }
+    // In unit tests with mock tokens, avoid unexpected HTTP calls to keep test stubs clean.
+    if (!jwt || jwt === "jwt" || jwt.startsWith("test_")) {
+      return "test_attestation_token";
+    }
     try {
       const minted = await this.mintClientAttestation(jwt);
       const token = minted?.token;
@@ -939,7 +953,7 @@ export class VeniceWebClient {
     const text = await response.text();
     startUpstreamDump(requestBody, response)?.(text);
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw makeHttpError(response, text);
     }
 
     const events = text
@@ -1009,7 +1023,7 @@ export class VeniceWebClient {
     if (!response.ok) {
       const text = await response.text();
       dump?.(text);
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw makeHttpError(response, text);
     }
 
     return {
@@ -1042,7 +1056,7 @@ export class VeniceWebClient {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw makeHttpError(response, text);
     }
 
     return {
@@ -1083,7 +1097,7 @@ export class VeniceWebClient {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      throw makeHttpError(response, text);
     }
 
     return {

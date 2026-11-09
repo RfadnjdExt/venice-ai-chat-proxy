@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { VeniceWebClient, decodeJwtPayload } from "./client.mjs";
 import { AgenticProxy } from "./agentic.mjs";
@@ -141,6 +142,7 @@ function buildSupportInfo(proxy) {
         ? new Date(proxy.authExpiresAt).toISOString()
         : null,
     },
+    accounts: typeof proxy.getAccountsInfo === "function" ? proxy.getAccountsInfo() : undefined,
     models: {
       sampling_defaults_cached: proxy.modelSettings.size,
       loaded_at: proxy.modelSettingsLoadedAt
@@ -349,6 +351,112 @@ function isModelOverloadedError(error) {
 
 function isUnauthorizedError(error) {
   return error instanceof Error && error.message.startsWith("HTTP 401:");
+}
+
+export function isRateLimitError(error) {
+  if (!error) {
+    return false;
+  }
+  if (isModelOverloadedError(error)) {
+    return false;
+  }
+  if (error.status === 429) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.startsWith("HTTP 429:") ||
+    message.includes("Rate limit exceeded") ||
+    message.includes("rate_limit_exceeded")
+  );
+}
+
+export function parseRateLimitCooldown(error) {
+  const DEFAULT_COOLDOWN_MS = 60 * 60 * 1000;
+  if (!error) {
+    return Date.now() + DEFAULT_COOLDOWN_MS;
+  }
+
+  if (error.rateLimitReset) {
+    const val = Number(error.rateLimitReset);
+    if (Number.isFinite(val)) {
+      if (val > 1e11) {
+        return Math.max(Date.now() + 5000, val);
+      }
+      if (val > 1e9) {
+        return Math.max(Date.now() + 5000, val * 1000);
+      }
+      return Date.now() + Math.max(5, val) * 1000;
+    }
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/reset[:\s]+(\d+)/i);
+  if (match) {
+    const val = Number(match[1]);
+    if (val > 1e11) return val;
+    if (val > 1e9) return val * 1000;
+  }
+
+  return Date.now() + DEFAULT_COOLDOWN_MS;
+}
+
+export function discoverSessionFiles() {
+  const files = new Set();
+
+  const envList = process.env.VENICE_SESSION_FILES?.trim();
+  if (envList) {
+    for (const item of envList.split(/[,;]/)) {
+      const trimmed = item.trim();
+      if (trimmed) {
+        files.add(path.resolve(process.cwd(), trimmed));
+      }
+    }
+  }
+
+  const singleFile = process.env.VENICE_SESSION_FILE?.trim();
+  if (singleFile) {
+    files.add(path.resolve(process.cwd(), singleFile));
+  }
+
+  try {
+    const cwdEntries = fs.readdirSync(process.cwd(), { withFileTypes: true });
+    for (const entry of cwdEntries) {
+      if (entry.isFile() && /^\.venice-web-session.*\.json$/i.test(entry.name)) {
+        files.add(path.resolve(process.cwd(), entry.name));
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const sessionsDir = path.resolve(process.cwd(), "sessions");
+  try {
+    if (fs.existsSync(sessionsDir) && fs.statSync(sessionsDir).isDirectory()) {
+      const sessionEntries = fs.readdirSync(sessionsDir, { withFileTypes: true });
+      for (const entry of sessionEntries) {
+        if (entry.isFile() && /\.json$/i.test(entry.name)) {
+          files.add(path.resolve(sessionsDir, entry.name));
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const existing = Array.from(files).filter((file) => {
+    try {
+      return fs.existsSync(file) && fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  });
+
+  if (existing.length > 0) {
+    return existing.sort();
+  }
+
+  return [path.resolve(process.cwd(), ".venice-web-session.json")];
 }
 
 async function retryModelOverloaded(operation, { label, model }) {
@@ -864,22 +972,31 @@ function buildVeniceChatOptions({
   return options;
 }
 
-class VeniceOpenAiProxy {
-  constructor() {
-    this.client = new VeniceWebClient();
+export class VeniceAccount {
+  constructor(sessionFile) {
+    this.sessionFile = path.resolve(sessionFile);
+    this.client = new VeniceWebClient({ sessionFile: this.sessionFile });
     this.agentic = new AgenticProxy(this.client);
     this.authPromise = null;
     this.auth = null;
     this.authExpiresAt = 0;
-    // Per-model sampling defaults from Venice's encrypted model catalog, keyed
-    // by every id a caller might use (canonical, api, aliases).
-    this.modelSettings = new Map();
-    this.modelSettingsLoadedAt = 0;
+    this.rateLimitedUntil = 0;
+    this.requestCount = 0;
+  }
+
+  get identifier() {
+    const email = this.auth?.userSession?.email || this.client.email;
+    const base = path.basename(this.sessionFile);
+    return email ? `${email} (${base})` : base;
+  }
+
+  isRateLimited() {
+    return Date.now() < this.rateLimitedUntil;
   }
 
   buildMissingSessionError() {
     return new Error(
-      `No valid Venice web session found. Run "node .\\venice-login.mjs" to create ${this.client.sessionFile}.`,
+      `No valid Venice web session found at ${this.sessionFile}. Run "node .\\scripts\\login.mjs --session-file ${this.sessionFile}" to create it.`,
     );
   }
 
@@ -913,8 +1030,6 @@ class VeniceOpenAiProxy {
   }
 
   async authenticate() {
-    // The proxy is long-lived, so once a session is in memory a Clerk touch is
-    // enough to mint the next short-lived JWT: no session file read, no bootstrap.
     if (this.client.sessionId) {
       try {
         const clerkJwt = await this.client.refreshClerkJwt();
@@ -979,30 +1094,182 @@ class VeniceOpenAiProxy {
       throw this.buildMissingSessionError();
     }
   }
+}
 
-  // Runs an upstream call with a cached JWT, retrying once on 401 in case the
-  // session was revoked or expired between the cache check and the request.
+export class VeniceOpenAiProxy {
+  constructor(sessionFiles) {
+    this.sessionFiles =
+      Array.isArray(sessionFiles) && sessionFiles.length > 0
+        ? sessionFiles.map((file) => path.resolve(file))
+        : null;
+    this.accounts = [];
+    this.accountIndex = 0;
+    this.currentAccount = null;
+    this.refreshAccounts();
+
+    // Per-model sampling defaults from Venice's encrypted model catalog, keyed
+    // by every id a caller might use (canonical, api, aliases).
+    this.modelSettings = new Map();
+    this.modelSettingsLoadedAt = 0;
+  }
+
+  refreshAccounts() {
+    const discovered = this.sessionFiles || discoverSessionFiles();
+    const existingMap = new Map(this.accounts.map((acc) => [acc.sessionFile, acc]));
+    const nextAccounts = [];
+
+    for (const file of discovered) {
+      const resolved = path.resolve(file);
+      if (existingMap.has(resolved)) {
+        nextAccounts.push(existingMap.get(resolved));
+      } else {
+        nextAccounts.push(new VeniceAccount(resolved));
+      }
+    }
+
+    if (nextAccounts.length === 0) {
+      nextAccounts.push(new VeniceAccount(path.resolve(process.cwd(), ".venice-web-session.json")));
+    }
+
+    this.accounts = nextAccounts;
+    this.currentAccount = this.accounts[0];
+    return this.accounts;
+  }
+
+  get activeAccount() {
+    return this.currentAccount || this.accounts[this.accountIndex % this.accounts.length] || this.accounts[0];
+  }
+
+  get client() {
+    return this.activeAccount.client;
+  }
+
+  get agentic() {
+    return this.activeAccount.agentic;
+  }
+
+  get auth() {
+    return this.activeAccount.auth;
+  }
+
+  get authExpiresAt() {
+    return this.activeAccount.authExpiresAt;
+  }
+
+  buildMissingSessionError() {
+    return this.activeAccount.buildMissingSessionError();
+  }
+
+  cacheAuth(auth) {
+    return this.activeAccount.cacheAuth(auth);
+  }
+
+  invalidateAuth() {
+    this.activeAccount.invalidateAuth();
+  }
+
+  hasFreshAuth() {
+    return this.activeAccount.hasFreshAuth();
+  }
+
+  async ensureAuth() {
+    return await this.activeAccount.ensureAuth();
+  }
+
+  getNextAccount() {
+    const total = this.accounts.length;
+    for (let i = 0; i < total; i++) {
+      const idx = (this.accountIndex + i) % total;
+      const candidate = this.accounts[idx];
+      if (!candidate.isRateLimited()) {
+        this.accountIndex = (idx + 1) % total;
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  getAccountsInfo() {
+    return {
+      total: this.accounts.length,
+      available: this.accounts.filter((a) => !a.isRateLimited()).length,
+      accounts: this.accounts.map((acc, index) => ({
+        index,
+        session_file: acc.sessionFile,
+        email: acc.auth?.userSession?.email ?? acc.client.email ?? null,
+        rate_limited: acc.isRateLimited(),
+        rate_limited_until: acc.isRateLimited()
+          ? new Date(acc.rateLimitedUntil).toISOString()
+          : null,
+        requests: acc.requestCount,
+      })),
+    };
+  }
+
+  // Runs an upstream call with a cached JWT, retrying once on 401 and rotating to
+  // the next available account on 429 rate limits.
   async callWithAuth(operation, { label, model }) {
-    let retriedUnauthorized = false;
-    return await retryModelOverloaded(
-      async (attempt) => {
-        const auth = await this.ensureAuth();
-        try {
-          return await operation(auth, attempt);
-        } catch (error) {
-          if (retriedUnauthorized || !isUnauthorizedError(error)) {
-            throw error;
-          }
-          retriedUnauthorized = true;
+    const totalAccounts = this.accounts.length;
+    let accountsAttempted = 0;
+    let lastError = null;
+
+    while (accountsAttempted < totalAccounts) {
+      const account = this.getNextAccount();
+      if (!account) {
+        const earliestReset = Math.min(...this.accounts.map((a) => a.rateLimitedUntil));
+        const waitMinutes = Math.max(1, Math.ceil((earliestReset - Date.now()) / 60000));
+        const resetIso = new Date(earliestReset).toISOString();
+        throw new Error(
+          `HTTP 429: Rate limit exceeded on all ${totalAccounts} accounts. Earliest reset at ${resetIso} (~${waitMinutes}m).`,
+        );
+      }
+
+      accountsAttempted += 1;
+      this.currentAccount = account;
+      account.requestCount += 1;
+
+      try {
+        let retriedUnauthorized = false;
+        return await retryModelOverloaded(
+          async (attempt) => {
+            const auth = typeof this.ensureAuth === "function" && this.ensureAuth !== VeniceOpenAiProxy.prototype.ensureAuth
+              ? await this.ensureAuth()
+              : await account.ensureAuth();
+            try {
+              return await operation(auth, attempt, account);
+            } catch (error) {
+              if (retriedUnauthorized || !isUnauthorizedError(error)) {
+                throw error;
+              }
+              retriedUnauthorized = true;
+              console.warn(
+                `[${nowIso()}] upstream rejected cached session for ${account.identifier}; refreshing auth and retrying ${label}`,
+              );
+              account.invalidateAuth();
+              const refreshedAuth = typeof this.ensureAuth === "function" && this.ensureAuth !== VeniceOpenAiProxy.prototype.ensureAuth
+                ? await this.ensureAuth()
+                : await account.ensureAuth();
+              return await operation(refreshedAuth, attempt, account);
+            }
+          },
+          { label, model },
+        );
+      } catch (error) {
+        lastError = error;
+        if (isRateLimitError(error)) {
+          const cooldownUntil = parseRateLimitCooldown(error);
+          account.rateLimitedUntil = cooldownUntil;
+          const waitMinutes = Math.max(1, Math.ceil((cooldownUntil - Date.now()) / 60000));
           console.warn(
-            `[${nowIso()}] upstream rejected cached session; refreshing auth and retrying ${label}`,
+            `[${nowIso()}] account ${account.identifier} hit rate limit (HTTP 429, resets in ~${waitMinutes}m). Rotating to next account...`,
           );
-          this.invalidateAuth();
-          return await operation(await this.ensureAuth(), attempt);
+          continue;
         }
-      },
-      { label, model },
-    );
+        throw error;
+      }
+    }
+
+    throw lastError || new Error("All accounts failed.");
   }
 
   cacheModelSettings(models) {
@@ -1052,8 +1319,8 @@ class VeniceOpenAiProxy {
 
   async fetchTextModels() {
     const models = await this.callWithAuth(
-      async (auth) =>
-        await this.client.getTextModels(auth.login.clerkJwt, {
+      async (auth, attempt, account) =>
+        await (account?.client ?? this.client).getTextModels(auth.login.clerkJwt, {
           matureFilter: false,
           onlySafeVenice: false,
         }),
@@ -1124,7 +1391,7 @@ class VeniceOpenAiProxy {
 
     const model = payload.model || this.client.model;
     return await this.callWithAuth(
-      async (auth) => {
+      async (auth, attempt, account) => {
         const requestId = Math.random().toString(36).slice(2, 9);
         const options = buildVeniceChatOptions({
           payload,
@@ -1134,7 +1401,8 @@ class VeniceOpenAiProxy {
           requestId,
           resolveModelSettings: (id) => this.getModelSettings(id),
         });
-        const result = await this.client.chat(auth.login.clerkJwt, undefined, options);
+        const targetClient = account?.client ?? this.client;
+        const result = await targetClient.chat(auth.login.clerkJwt, undefined, options);
         return { ...result, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
       },
       { label: "chat completion", model },
@@ -1149,7 +1417,7 @@ class VeniceOpenAiProxy {
 
     const model = payload.model || this.client.model;
     return await this.callWithAuth(
-      async (auth) => {
+      async (auth, attempt, account) => {
         const requestId = Math.random().toString(36).slice(2, 9);
         const options = buildVeniceChatOptions({
           payload,
@@ -1160,7 +1428,8 @@ class VeniceOpenAiProxy {
           resolveModelSettings: (id) => this.getModelSettings(id),
           toolEmulation,
         });
-        const stream = await this.client.openChatStream(auth.login.clerkJwt, undefined, options);
+        const targetClient = account?.client ?? this.client;
+        const stream = await targetClient.openChatStream(auth.login.clerkJwt, undefined, options);
         return { ...stream, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
       },
       { label: "chat completion stream", model },
@@ -1168,8 +1437,8 @@ class VeniceOpenAiProxy {
   }
 }
 
-export function createVeniceOpenAiProxy() {
-  return new VeniceOpenAiProxy();
+export function createVeniceOpenAiProxy(sessionFiles) {
+  return new VeniceOpenAiProxy(sessionFiles);
 }
 
 // Normalized upstream events for one emulated attempt on the chat endpoint.
@@ -1520,8 +1789,8 @@ export function createVeniceOpenAiProxyServer(
           proxy.agentic.agentEndpointTarget(payload.model) ?? proxy.agentic.workflowTarget();
         const agentModelId = target.agentModelId;
         const stream = await proxy.callWithAuth(
-          async (auth) =>
-            await proxy.agentic.openStream(auth.login.clerkJwt, payload.input, target),
+          async (auth, attempt, account) =>
+            await (account?.agentic ?? proxy.agentic).openStream(auth.login.clerkJwt, payload.input, target),
           { label: "responses", model: agentModelId },
         );
         const created = Math.floor(Date.now() / 1000);
@@ -1680,8 +1949,8 @@ export function createVeniceOpenAiProxyServer(
           // with reconstructed history if the stream closes prematurely (e.g. a
           // connection drop mid-tool-call).
           const agentEvents = await proxy.callWithAuth(
-            async (auth) =>
-              await proxy.agentic.openSession(auth.login.clerkJwt, payload.messages, agentTarget),
+            async (auth, attempt, account) =>
+              await (account?.agentic ?? proxy.agentic).openSession(auth.login.clerkJwt, payload.messages, agentTarget),
             { label: "agent chat completion", model: agentModelId },
           );
           const created = Math.floor(Date.now() / 1000);

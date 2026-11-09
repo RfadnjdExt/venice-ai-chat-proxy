@@ -86,6 +86,30 @@ function readMfaCodeArg() {
   return fromEnv || "";
 }
 
+function readSessionFileArg() {
+  const fromEnv = process.env.VENICE_SESSION_FILE?.trim();
+  const index = process.argv.findIndex(
+    (arg) => arg === "--session-file" || arg.startsWith("--session-file="),
+  );
+  if (index === -1) {
+    return fromEnv || null;
+  }
+
+  const arg = process.argv[index];
+  const inline = arg.startsWith("--session-file=")
+    ? arg.slice("--session-file=".length).trim()
+    : "";
+  if (inline) {
+    return inline;
+  }
+
+  const next = process.argv[index + 1];
+  if (next && !next.startsWith("--")) {
+    return next.trim();
+  }
+  return fromEnv || null;
+}
+
 async function loginDirect(client) {
   const login = await client.login();
   const userSession = await client.getUserSession(login.clerkJwt);
@@ -159,8 +183,10 @@ function resolveSessionFile(sessionFile) {
 }
 
 async function cleanSessionData(credentials) {
+  const cliSessionFile = readSessionFileArg();
   const sessionFiles = new Set(
     [
+      cliSessionFile,
       process.env.VENICE_SESSION_FILE?.trim(),
       credentials.sessionFile,
       DEFAULT_SESSION_FILE,
@@ -209,8 +235,8 @@ async function main() {
       throw new Error("A two-factor code is required.");
     }
     // The pending state already records the session file chosen in step one; an
-    // explicit VENICE_SESSION_FILE still wins.
-    const sessionFile = process.env.VENICE_SESSION_FILE?.trim();
+    // explicit --session-file or VENICE_SESSION_FILE still wins.
+    const sessionFile = readSessionFileArg();
     console.log(
       JSON.stringify(
         await completeMfaLogin({ code, ...(sessionFile ? { sessionFile } : {}) }),
@@ -229,7 +255,7 @@ async function main() {
     process.env.VENICE_PASSWORD ||
     credentials.password ||
     (restoreOnlyFlag ? "" : await askHidden("Venice password: "));
-  const sessionFile = process.env.VENICE_SESSION_FILE?.trim() || credentials.sessionFile;
+  const sessionFile = readSessionFileArg() || credentials.sessionFile;
 
   if (!restoreOnlyFlag) {
     if (!email) {

@@ -1,7 +1,7 @@
+import path from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { VeniceWebClient } from "./src/client.mjs";
-import { startVeniceOpenAiProxyServer } from "./src/proxy.mjs";
+import { startVeniceOpenAiProxyServer, discoverSessionFiles } from "./src/proxy.mjs";
 
 function runLoginUtility(args = []) {
   return new Promise((resolve, reject) => {
@@ -28,31 +28,45 @@ function runLoginUtility(args = []) {
 }
 
 async function main() {
-  let loginOutput;
-  try {
-    loginOutput = await runLoginUtility(["--restore-only"]);
-  } catch (error) {
-    console.error(`Saved session restore failed: ${error.message}`);
-    console.error("Running browserless curl_cffi login utility...");
-    loginOutput = await runLoginUtility();
+  const sessionFiles = discoverSessionFiles();
+  const restoreResults = [];
+
+  for (const sessionFile of sessionFiles) {
+    try {
+      const output = await runLoginUtility(["--restore-only", `--session-file=${sessionFile}`]);
+      let parsed = null;
+      try {
+        parsed = JSON.parse(output);
+      } catch {
+        // ignore
+      }
+      restoreResults.push({ sessionFile, ok: true, data: parsed });
+    } catch (error) {
+      restoreResults.push({ sessionFile, ok: false, error: error.message });
+    }
   }
 
-  const client = new VeniceWebClient();
-  const auth = await client.ensureAuthenticated();
-  console.log(
-    JSON.stringify(
-      {
-        ok: true,
-        authSource: auth.source,
-        sessionFile: process.env.VENICE_SESSION_FILE || client.sessionFile,
-        sessionId: auth.login?.sessionId ?? null,
-        email: auth.userSession?.email ?? client.email,
-        login: JSON.parse(loginOutput),
-      },
-      null,
-      2,
-    ),
-  );
+  const anyOk = restoreResults.some((r) => r.ok);
+  if (!anyOk && sessionFiles.length <= 1) {
+    console.error("Saved session restore failed. Running login utility...");
+    try {
+      const output = await runLoginUtility();
+      restoreResults.push({ sessionFile: sessionFiles[0], ok: true, data: JSON.parse(output) });
+    } catch (e) {
+      console.error(`Login failed: ${e.message}`);
+    }
+  }
+
+  console.log(`Loaded account pool (${sessionFiles.length} session file(s)):`);
+  for (const res of restoreResults) {
+    const base = path.basename(res.sessionFile);
+    if (res.ok) {
+      const email = res.data?.email || "active";
+      console.log(`  ✓ ${base}: ${email}`);
+    } else {
+      console.log(`  ✗ ${base}: ${res.error || "failed"}`);
+    }
+  }
 
   const { host, port } = await startVeniceOpenAiProxyServer();
   console.log(`Venice OpenAI proxy listening on http://${host}:${port}`);

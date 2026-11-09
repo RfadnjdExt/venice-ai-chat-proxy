@@ -4,6 +4,7 @@
     "check:context": "node ./check/context.mjs",
     "check:messages": "node ./check/messages.mjs",
     "check:models": "node ./check/models.mjs",
+    "check:multi-account": "node ./check/multi-account.mjs",
     "check:null-bytes": "node ./check/null-bytes.mjs",
     "check:openai-client": "node ./check/openai.mjs",
     "check:tool-emulation": "node ./check/tool-emulation.mjs",
