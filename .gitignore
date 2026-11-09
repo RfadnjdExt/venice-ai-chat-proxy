@@ -4,3 +4,4 @@ venice-login.json
 sessions/
 node_modules/
 venice-2fa-first-step.json
+proxy-restart*.log

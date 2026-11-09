@@ -1691,6 +1691,71 @@ function testDsml() {
   );
   ok("streamed DSML call array parsed", streamedMulti.calls.length === 2);
   ok("streamed DSML keeps the message before the calls", streamedMulti.text.trim() === "Thinking...");
+
+  // ── XML-ish DSML (live deepseek-v4-1-flash-uncensored output) ──
+  const XB = "<|DSML|calls>";
+  const XE = "</|DSML|calls>";
+  const XI = (name) => `<|DSML|invoke name="${name}">`;
+  const XIE = "</|DSML|invoke>";
+  const XP = (name, value, asString = true) =>
+    `<|DSML|parameter name="${name}"${asString ? ' string="true"' : ""}>${value}</|DSML|parameter>`;
+
+  // The captured write call: quotes, backslashes, regexes, and a trailing
+  // newline inside a string parameter must survive byte for byte.
+  const fileContent = [
+    '// config.js: "quoted" and \'single\' values',
+    "export const settings = {",
+    '  windowsPath: "C:\\\\Users\\\\dev\\\\project",',
+    "  pattern: /^\\d{3}-\\d{4}$/,",
+    '  greeting: `He said "hi" and left\\n`,',
+    '  tab: "a\\tb",',
+    "};",
+    "",
+  ].join("\n");
+  const xml = `\n\n${XB}\n${XI("read_file")}\n${XP("path", "/tmp/opencode-check/config.js")}\n${XP("content", fileContent)}\n${XIE}\n${XE}`;
+
+  const liveShape = parse(xml);
+  ok("XML DSML call parsed", liveShape.toolCalls.length === 1);
+  ok("XML DSML tool name parsed", liveShape.toolCalls[0]?.function.name === "read_file");
+  ok("XML DSML string parameter is kept verbatim",
+    args(liveShape.toolCalls[0]).content === fileContent);
+  ok("XML DSML path parameter parsed", args(liveShape.toolCalls[0]).path === "/tmp/opencode-check/config.js");
+  ok("XML DSML leaves no content", liveShape.content === null);
+  ok("XML DSML markup never leaks as content", !String(liveShape.content ?? "").includes("DSML"));
+
+  const xmlMulti = parse(
+    `${XB}${XI("read_file")}${XP("path", "a")}${XIE}\n${XI("get_weather")}${XP("city", "Rome")}${XIE}${XE}`,
+  );
+  ok("multiple XML DSML invokes parsed in order",
+    xmlMulti.toolCalls.map((call) => call.function.name).join(",") === "read_file,get_weather");
+  ok("multiple XML DSML invokes leave no content", xmlMulti.content === null);
+
+  const noParams = parse(`${XB}${XI("get_weather")}${XIE}${XE}`);
+  ok("XML DSML invoke without parameters parsed",
+    noParams.toolCalls.length === 1 && noParams.toolCalls[0].function.arguments === "{}");
+
+  const nonString = parse(
+    `${XB}${XI("get_weather")}${XP("city", "Paris")}${XP("days", "3", false)}${XIE}${XE}`,
+  );
+  ok("XML DSML non-string parameter is JSON", args(nonString.toolCalls[0]).days === 3);
+
+  const xmlText = parse(`Checking.\n${XB}${XI("read_file")}${XP("path", "a")}${XIE}${XE}\nDone.`);
+  ok("XML DSML keeps text before the calls", xmlText.content === "Checking.");
+  ok("XML DSML drops text after the calls", !String(xmlText.content).includes("Done"));
+
+  const xmlUnknown = parse(`${XB}${XI("delete_everything")}${XIE}${XE}`);
+  ok("unknown XML DSML tool is a warning, not a call",
+    xmlUnknown.toolCalls.length === 0 && xmlUnknown.warnings.length === 1);
+
+  const xmlStreamed = feed(xml, { chunkSize: 1 });
+  ok("streamed XML DSML call parsed one byte at a time", xmlStreamed.calls.length === 1);
+  ok("streamed XML DSML string parameter is kept verbatim",
+    args(xmlStreamed.calls[0]).content === fileContent);
+  ok("streamed XML DSML leaves no stray text", xmlStreamed.text === "");
+
+  const xmlTruncated = feed(`${XB}${XI("read_file")}${XP("path", "a")}${XP("content", "abc")}`, { chunkSize: 3 });
+  ok("truncated XML DSML call is best-effort parsed",
+    xmlTruncated.calls.length === 1 && args(xmlTruncated.calls[0]).path === "a");
 }
 
 async function main() {

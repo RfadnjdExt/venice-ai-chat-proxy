@@ -524,6 +524,14 @@ How it works:
      as ordinary content. The `<|tool▁calls▁begin|>`/`<|tool▁calls▁end|>` array wrapper and the
      ASCII-underscore spelling (`<|tool_call_begin|>`, `<|tool_sep|>`) are accepted too.
      (The separator in the tokens is U+2581.)
+   - the XML-ish DSML dialect that newer DeepSeek builds also emit, with the name and the
+     arguments in attributes instead of a body:
+     `<|DSML|calls>`<br>`<|DSML|invoke name="write">`<br>
+     `<|DSML|parameter name="path" string="true">src/a.js</|DSML|parameter>`<br>
+     `</|DSML|invoke>`<br>`</|DSML|calls>`.
+     `string="true"` keeps the value verbatim (quotes, backslashes and newlines included);
+     without it the value is read as JSON. Several invokes in one `<|DSML|calls>` block, an
+     invoke with no parameters, and a block cut off at the end of the stream are handled too.
 
    Raw newlines and tabs inside JSON strings are escaped before parsing, and stray closing
    tags after the JSON are ignored. A block cut off at the end of the stream is still tried,
