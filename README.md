@@ -26,7 +26,7 @@ The proxy translates OpenAI-style chat requests into Venice web requests, then t
 
 - Node.js 22 or newer
 - a Venice account
-- a saved session file, valid `VENICE_EMAIL` and `VENICE_PASSWORD`, or a Google account plus an installed Chrome/Edge for `npm run login:google`
+- a saved session file, valid `VENICE_EMAIL` and `VENICE_PASSWORD`, a Google account plus an installed Chrome/Edge for `npm run login:google`, or a `__client` cookie copied from a browser for `npm run login:cookies`
 
 ## Project files
 
@@ -39,6 +39,7 @@ Main scripts in this repo:
 - `scripts/login.mjs`: local login utility that creates the session file (`npm run login`)
 - `scripts/login-wreq.mjs`: browserless Clerk login flow used by `scripts/login.mjs`
 - `scripts/login-google.mjs`: interactive Google/OAuth login flow used by `npm run login:google`
+- `scripts/login-cookies.mjs`: manual cookie import for machines without a browser (`npm run login:cookies`)
 - `scripts/convert.mjs`: transcript-to-import JSON converter (`npm run convert:chat`)
 - `scripts/deploy.sh`: builds and restarts the Compose service with the current commit stamped into the image
 - `check/models.mjs`: quick `/v1/models` smoke test (`npm run check:models`)
@@ -165,20 +166,48 @@ The persistent profile above is the practical equivalent: sign in to Google once
 behaves like your own profile for this tool, without weakening the browser's cookie
 encryption or exposing your browsing session to a debug port.
 
+##### Login without a browser (cookie import)
+
+If the machine running the proxy has no browser at all, sign in with Google in **any**
+browser and hand the resulting cookie to the CLI. Nothing is launched:
+
+```powershell
+npm run login:cookies                      # prompts for the value
+node ./scripts/login.mjs --cookies-file cookies.json
+```
+
+Only the `__client` cookie is required. In the logged-in browser open
+DevTools > Application > Cookies > `https://clerk.venice.ai`, copy the `__client` value
+(it is httpOnly, so it is not visible from the console), and paste it. The importer also
+accepts a `Cookie:` header, a Cookie-Editor/EditThisCookie JSON export, a Netscape
+`cookies.txt`, or this project's own snapshot JSON. Other Venice cookies are optional;
+non-Venice domains are dropped.
+
+Copying the **URL** after logging in does not work, and no header/cookie can be derived
+from it: once Google redirects back, Clerk answers with `Set-Cookie` and the browser goes
+on to `https://venice.ai/chat`. The cookie is the credential, not the address. The one
+credential that does travel in a URL, Google's authorization `code`, is single-use and
+already redeemed by the time the address bar shows it.
+
+Treat a copied `__client` like a password. It is rotated by Clerk on the next request, so
+the session file written right after the import holds the newer value.
+
 Google login needs an interactive desktop session. On a headless server, run it on a
-machine with a browser and copy the resulting session file to the server.
+machine with a browser and copy the resulting session file (or the `__client` cookie) to
+the server.
 
 Optional modes:
 
 ```powershell
 npm run login:google
+npm run login:cookies
 npm run login:restore
 npm run login:restore-only
 npm run login:direct
 npm run clean-session
 ```
 
-`--restore-only` refreshes from the saved session/cookies and never falls back to credential login. `--restore` keeps the older restore/direct fallback behavior for debugging. `--direct` uses the plain Node fetch implementation, which is useful for confirming Clerk bot/rate rejection but is not the normal login path. `--clean-session` removes saved Venice session files, including the configured `VENICE_SESSION_FILE` and the default `.venice-web-session.json`, without deleting `venice-login.json`.
+`--restore-only` refreshes from the saved session/cookies and never falls back to credential login. `--restore` keeps the older restore/direct fallback behavior for debugging. `--direct` uses the plain Node fetch implementation, which is useful for confirming Clerk bot/rate rejection but is not the normal login path. `--cookies-file <path>` / `--paste-cookies` build a session from a copied `__client` cookie without launching a browser. `--clean-session` removes saved Venice session files, including the configured `VENICE_SESSION_FILE` and the default `.venice-web-session.json`, without deleting `venice-login.json`.
 
 ### Session caching
 

@@ -130,9 +130,13 @@ export function toSessionCookie(cookie) {
   };
 }
 
+export function isVeniceCookieDomain(domain) {
+  return COOKIE_DOMAIN_RE.test(String(domain ?? ""));
+}
+
 export function extractVeniceCookies(cookies) {
   return (Array.isArray(cookies) ? cookies : [])
-    .filter((cookie) => COOKIE_DOMAIN_RE.test(String(cookie?.domain ?? "")))
+    .filter((cookie) => isVeniceCookieDomain(cookie?.domain))
     .map(toSessionCookie)
     .filter(Boolean);
 }
@@ -379,7 +383,15 @@ export async function readBrowserSession(cdp, sessions) {
   return null;
 }
 
-async function saveGoogleSession({ client, cookies, browserSession }) {
+// Shared by the browser flow and the manual cookie import: install the captured
+// Venice/Clerk cookies, let Clerk resolve the session from them, verify against
+// outerface, and write the same snapshot file the password flow writes.
+export async function saveCapturedSession({
+  client,
+  cookies,
+  browserSession = null,
+  loginMethod = "google",
+}) {
   client.cookies.import(cookies);
   client.wreqSeeded = false;
 
@@ -391,14 +403,14 @@ async function saveGoogleSession({ client, cookies, browserSession }) {
       throw error;
     }
     console.warn(
-      `[login:google] cookie restore failed (${error.message}); using the session token captured from the browser.`,
+      `[login:${loginMethod}] cookie restore failed (${error.message}); using the session token captured from the browser.`,
     );
   }
 
   const clerkJwt = restored?.clerkJwt || browserSession?.token;
   const sessionId = restored?.sessionId || browserSession?.sessionId;
   if (!clerkJwt || !sessionId) {
-    throw new Error("Google sign-in finished but no Clerk session could be captured.");
+    throw new Error("Capture finished but no Clerk session could be resolved from the cookies.");
   }
 
   client.sessionId = sessionId;
@@ -409,7 +421,7 @@ async function saveGoogleSession({ client, cookies, browserSession }) {
     userSession = await client.getUserSession(clerkJwt);
   } catch (error) {
     console.warn(
-      `[login:google] could not verify the session against outerface (${error.message}); keeping the captured session.`,
+      `[login:${loginMethod}] could not verify the session against outerface (${error.message}); keeping the captured session.`,
     );
   }
 
@@ -427,13 +439,13 @@ async function saveGoogleSession({ client, cookies, browserSession }) {
     userSession?.id || userSession?.user?.id || client.userDistinctId || crypto.randomUUID();
 
   client.writeSavedSession({
-    loginMethod: "google",
+    loginMethod,
     lastValidatedAt: Date.now(),
   });
 
   return {
     ok: true,
-    source: "google",
+    source: loginMethod,
     sessionFile: client.sessionFile,
     email,
     sessionId,
@@ -519,7 +531,7 @@ export async function loginWithGoogle({ sessionFile, timeoutMs, freshProfile = f
 
     const client = new VeniceWebClient({ sessionFile: targetFile });
     try {
-      const result = await saveGoogleSession({ client, cookies, browserSession });
+      const result = await saveCapturedSession({ client, cookies, browserSession });
       return { ...result, profileDir };
     } finally {
       await client.close();

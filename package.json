@@ -2,6 +2,7 @@
   "scripts": {
     "check:concurrency": "node ./check/concurrency.mjs",
     "check:context": "node ./check/context.mjs",
+    "check:cookie-import": "node ./check/cookie-import.mjs",
     "check:google-login": "node ./check/google-login.mjs",
     "check:messages": "node ./check/messages.mjs",
     "check:models": "node ./check/models.mjs",
@@ -13,6 +14,7 @@
     "clean-session": "node ./scripts/login.mjs --clean-session",
     "convert:chat": "node ./scripts/convert.mjs",
     "login": "node ./scripts/login.mjs",
+    "login:cookies": "node ./scripts/login.mjs --paste-cookies",
     "login:direct": "node ./scripts/login.mjs --direct",
     "login:google": "node ./scripts/login.mjs --google",
     "login:restore": "node ./scripts/login.mjs --restore",

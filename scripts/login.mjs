@@ -34,6 +34,18 @@ function ask(question) {
   });
 }
 
+// Same as ask(), but the prompt goes to stderr so stdout stays parseable JSON
+// (index.mjs and the login fallback read stdout as JSON).
+function askOnStderr(question) {
+  const rl = readline.createInterface({ input, output: process.stderr });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
 function askHidden(question) {
   const rl = readline.createInterface({ input, output, terminal: true });
   return new Promise((resolve) => {
@@ -108,6 +120,23 @@ function readSessionFileArg() {
     return next.trim();
   }
   return fromEnv || null;
+}
+
+function readValueArg(flag) {
+  const index = process.argv.findIndex((arg) => arg === flag || arg.startsWith(`${flag}=`));
+  if (index === -1) {
+    return null;
+  }
+  const arg = process.argv[index];
+  const inline = arg.startsWith(`${flag}=`) ? arg.slice(flag.length + 1).trim() : "";
+  if (inline) {
+    return inline;
+  }
+  const next = process.argv[index + 1];
+  if (next && !next.startsWith("--")) {
+    return next.trim();
+  }
+  return null;
 }
 
 async function loginDirect(client) {
@@ -220,6 +249,8 @@ async function main() {
   const restoreOnlyFlag = process.argv.includes("--restore-only");
   const directOnly = process.argv.includes("--direct");
   const freshProfileFlag = process.argv.includes("--fresh-profile");
+  const cookiesFileFlag = readValueArg("--cookies-file");
+  const pasteCookiesFlag = process.argv.includes("--paste-cookies");
   const mfaFlag = process.argv.some(
     (arg) => arg === "--mfa-code" || arg.startsWith("--mfa-code="),
   );
@@ -231,11 +262,56 @@ async function main() {
       !restoreOnlyFlag &&
       !directOnly &&
       !mfaFlag &&
+      !cookiesFileFlag &&
+      !pasteCookiesFlag &&
       process.env.VENICE_LOGIN_METHOD?.trim().toLowerCase() === "google");
   const credentials = await readCredentialsFile();
 
   if (cleanSessionFlag) {
     console.log(JSON.stringify(await cleanSessionData(credentials), null, 2));
+    return;
+  }
+
+  if (cookiesFileFlag || pasteCookiesFlag) {
+    if (mfaFlag || process.env.VENICE_MFA_CODE?.trim()) {
+      throw new Error("--cookies-file and --paste-cookies do not use an MFA code.");
+    }
+    if (restoreOnlyFlag || restoreFlag || directOnly) {
+      throw new Error(
+        "--cookies-file/--paste-cookies cannot be combined with --restore, --restore-only or --direct.",
+      );
+    }
+    if (process.argv.includes("--google")) {
+      throw new Error(
+        "--google opens a browser; drop it and use only --cookies-file or --paste-cookies.",
+      );
+    }
+    if (freshProfileFlag) {
+      throw new Error("--fresh-profile only applies to --google.");
+    }
+
+    const { loginWithCookies, cookieInputHint } = await import("./login-cookies.mjs");
+    let text = "";
+    if (cookiesFileFlag) {
+      const cookiesPath = path.resolve(process.cwd(), cookiesFileFlag);
+      text = await readFile(cookiesPath, "utf8");
+    } else {
+      console.error(cookieInputHint());
+      text = await askOnStderr("Paste the cookie value (or a cookie header/JSON export): ");
+    }
+    if (!text.trim()) {
+      throw new Error(`No cookie input was provided.\n${cookieInputHint()}`);
+    }
+
+    const sessionFile =
+      readSessionFileArg() || credentials.sessionFile || DEFAULT_SESSION_FILE;
+    console.log(
+      JSON.stringify(
+        await loginWithCookies({ sessionFile: resolveSessionFile(sessionFile), text }),
+        null,
+        2,
+      ),
+    );
     return;
   }
 
