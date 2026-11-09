@@ -1756,6 +1756,41 @@ function testDsml() {
   const xmlTruncated = feed(`${XB}${XI("read_file")}${XP("path", "a")}${XP("content", "abc")}`, { chunkSize: 3 });
   ok("truncated XML DSML call is best-effort parsed",
     xmlTruncated.calls.length === 1 && args(xmlTruncated.calls[0]).path === "a");
+
+  // The live model writes the pipe as U+FF5C FULLWIDTH VERTICAL LINE.
+  const fullwidth = (text) => text.replace(/<(\/?)\|DSML\|/g, "<$1\uFF5CDSML\uFF5C");
+  const fwXml = fullwidth(xml);
+  const fw = parse(fwXml);
+  ok("fullwidth-pipe XML DSML call parsed", fw.toolCalls.length === 1);
+  ok("fullwidth-pipe XML DSML parameter kept verbatim",
+    args(fw.toolCalls[0]).content === fileContent);
+  ok("fullwidth-pipe XML DSML leaves no content", fw.content === null);
+
+  const fwStream = feed(fwXml, { chunkSize: 1 });
+  ok("streamed fullwidth-pipe XML DSML call parsed", fwStream.calls.length === 1);
+  ok("streamed fullwidth-pipe XML DSML parameter kept verbatim",
+    args(fwStream.calls[0]).content === fileContent);
+  ok("streamed fullwidth-pipe XML DSML leaves no stray text", fwStream.text === "");
+
+  const fwLegacy = parse(
+    '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{"city":"Oslo"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+  );
+  ok("fullwidth-pipe legacy DSML call parsed", fwLegacy.toolCalls.length === 1 && args(fwLegacy.toolCalls[0]).city === "Oslo");
+
+  // Exactly as captured live: fullwidth pipe and a space after it.
+  const liveSpelling = (text) => text.replace(/<(\/?)\|DSML\|/g, "<$1\uFF5CDSML\uFF5C ");
+  const spacedXml = liveSpelling(xml);
+  const spaced = parse(spacedXml);
+  ok("live-spelled XML DSML call parsed", spaced.toolCalls.length === 1);
+  ok("live-spelled XML DSML parameter kept verbatim",
+    args(spaced.toolCalls[0]).content === fileContent);
+  ok("live-spelled XML DSML leaves no content", spaced.content === null);
+
+  const spacedStream = feed(spacedXml, { chunkSize: 1 });
+  ok("streamed live-spelled XML DSML call parsed", spacedStream.calls.length === 1);
+  ok("streamed live-spelled XML DSML parameter kept verbatim",
+    args(spacedStream.calls[0]).content === fileContent);
+  ok("streamed live-spelled XML DSML leaves no stray text", spacedStream.text === "");
 }
 
 async function main() {

@@ -28,32 +28,66 @@ const CALL_TAGS = [
 //   ```
 //   <|tool▁call▁end|>
 // and the array form wraps those in <|tool▁calls▁begin|>…<|tool▁calls▁end|>.
-// The tokens are written with U+2581, and some servers render them with ASCII
-// underscores instead, so both spellings are accepted. DeepSeek falls back to
-// this format even when the prompt asks for <tool_call> JSON, and Venice does
-// not strip it, so without these tags a call reaches the client as content.
+// DeepSeek falls back to this format even when the prompt asks for <tool_call>
+// JSON, and Venice does not strip it, so without these tags a call reaches the
+// client as content. The tokens are written with U+2581, but some servers use
+// ASCII underscores instead. The live model also writes the pipe as the
+// fullwidth vertical line U+FF5C; all spellings (and mixed ones) are accepted.
+function pipeVariants(token) {
+  return [...token].reduce(
+    (variants, character) =>
+      character === "|"
+        ? variants.flatMap((variant) => [variant + "|", `${variant}\uFF5C`])
+        : variants.map((variant) => variant + character),
+    [""],
+  );
+}
+
+// Earliest occurrence of any variant, used for tokens whose pipes may be ASCII
+// or fullwidth.
+function findEarliestToken(text, tokens, from = 0) {
+  let index = -1;
+  let token = "";
+  for (const candidate of tokens) {
+    const at = text.indexOf(candidate, from);
+    if (at !== -1 && (index === -1 || at < index)) {
+      index = at;
+      token = candidate;
+    }
+  }
+  return { index, token };
+}
+
 const DSML_SEP = "<|tool\u2581sep|>";
 const DSML_CALL_BEGIN = "<|tool\u2581call\u2581begin|>";
 const DSML_CALL_END = "<|tool\u2581call\u2581end|>";
+const DSML_CALL_BEGIN_ASCII = "<|tool_call_begin|>";
+const DSML_CALL_END_ASCII = "<|tool_call_end|>";
 const DSML_CALLS_BEGIN = "<|tool\u2581calls\u2581begin|>";
 const DSML_CALLS_END = "<|tool\u2581calls\u2581end|>";
-const DSML_OPEN = [
-  {
-    open: DSML_CALL_BEGIN,
-    close: [DSML_CALL_END, "<|tool_call_end|>"],
-    wrapper: true,
-    complete: true,
-  },
-  {
-    open: "<|tool_call_begin|>",
-    close: [DSML_CALL_END, "<|tool_call_end|>"],
-    wrapper: true,
-    complete: true,
-  },
+const DSML_CALLS_BEGIN_ASCII = "<|tool_calls_begin|>";
+const DSML_CALLS_END_ASCII = "<|tool_calls_end|>";
+const DSML_CALL_END_VARIANTS = [
+  ...pipeVariants(DSML_CALL_END),
+  ...pipeVariants(DSML_CALL_END_ASCII),
 ];
+const DSML_OPEN = [
+  ...pipeVariants(DSML_CALL_BEGIN),
+  ...pipeVariants(DSML_CALL_BEGIN_ASCII),
+].map((open) => ({
+  open,
+  close: DSML_CALL_END_VARIANTS,
+  wrapper: true,
+  complete: true,
+}));
 CALL_TAGS.push(...DSML_OPEN);
 // Array wrappers carry no call of their own; they are dropped from the stream.
-const DSML_NOISE = [DSML_CALLS_BEGIN, DSML_CALLS_END, "<|tool_calls_begin|>", "<|tool_calls_end|>"];
+const DSML_NOISE = [
+  ...pipeVariants(DSML_CALLS_BEGIN),
+  ...pipeVariants(DSML_CALLS_END),
+  ...pipeVariants(DSML_CALLS_BEGIN_ASCII),
+  ...pipeVariants(DSML_CALLS_END_ASCII),
+];
 
 // Newer DeepSeek builds also use an XML-ish DSML dialect, even for models that
 // are not DeepSeek; Venice passes it through untouched:
@@ -70,13 +104,18 @@ const DSML_XML_INVOKE = "<|DSML|invoke";
 const DSML_XML_INVOKE_END = "</|DSML|invoke>";
 const DSML_XML_PARAMETER = "<|DSML|parameter";
 const DSML_XML_PARAMETER_END = "</|DSML|parameter>";
-DSML_NOISE.push(DSML_XML_CALLS_BEGIN, DSML_XML_CALLS_END);
-CALL_TAGS.push({
-  open: DSML_XML_INVOKE,
-  close: DSML_XML_INVOKE_END,
-  wrapper: true,
-  dynamic: "dsml-invoke",
-});
+const DSML_XML_INVOKE_END_VARIANTS = pipeVariants(DSML_XML_INVOKE_END);
+const DSML_XML_PARAMETER_VARIANTS = pipeVariants(DSML_XML_PARAMETER);
+const DSML_XML_PARAMETER_END_VARIANTS = pipeVariants(DSML_XML_PARAMETER_END);
+DSML_NOISE.push(...pipeVariants(DSML_XML_CALLS_BEGIN), ...pipeVariants(DSML_XML_CALLS_END));
+CALL_TAGS.push(
+  ...pipeVariants(DSML_XML_INVOKE).map((open) => ({
+    open,
+    close: DSML_XML_INVOKE_END_VARIANTS,
+    wrapper: true,
+    dynamic: "dsml-invoke",
+  })),
+);
 const SNIPPET_MAX_CHARS = 200;
 
 export function parseToolEmulationSetting(value) {
@@ -1014,7 +1053,7 @@ function parseGlmArgsWithoutKeyTags(tool, rest, terminated) {
 // or a hybrid of a key tag and JSON.
 function parseCallArguments(tool, rest, terminated) {
   // A DSML call may put the separator between the name and the arguments.
-  rest = rest.replace(/^\s*<\|tool[_\u2581]sep\|>\s*/, "");
+  rest = rest.replace(/^\s*<[|\uFF5C]tool[_\u2581]sep[|\uFF5C]>\s*/, "");
   if (!rest.trim()) {
     return buildToolCall(tool, {});
   }
@@ -1111,22 +1150,22 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   let found = false;
   let cursor = 0;
   for (;;) {
-    const start = source.indexOf(DSML_XML_PARAMETER, cursor);
-    if (start === -1) {
+    const start = findEarliestToken(source, DSML_XML_PARAMETER_VARIANTS, cursor);
+    if (start.index === -1) {
       break;
     }
-    const tagEnd = source.indexOf(">", start + DSML_XML_PARAMETER.length);
+    const tagEnd = source.indexOf(">", start.index + start.token.length);
     if (tagEnd === -1) {
       if (!terminated) {
         break;
       }
       return { error: `unterminated parameter for "${tool.name}"` };
     }
-    const attributes = parseDsmlAttributes(source.slice(start + DSML_XML_PARAMETER.length, tagEnd));
+    const attributes = parseDsmlAttributes(source.slice(start.index + start.token.length, tagEnd));
     const key = String(attributes.name ?? "").trim();
     const valueStart = tagEnd + 1;
-    const valueEnd = source.indexOf(DSML_XML_PARAMETER_END, valueStart);
-    if (valueEnd === -1) {
+    const valueEnd = findEarliestToken(source, DSML_XML_PARAMETER_END_VARIANTS, valueStart);
+    if (valueEnd.index === -1) {
       if (!terminated) {
         if (key) {
           parsedArgs[key] = parseDsmlParameterValue(attributes, source.slice(valueStart), tool, key);
@@ -1137,10 +1176,10 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
       return { error: `unterminated parameter "${key}" for "${tool.name}"` };
     }
     if (key) {
-      parsedArgs[key] = parseDsmlParameterValue(attributes, source.slice(valueStart, valueEnd), tool, key);
+      parsedArgs[key] = parseDsmlParameterValue(attributes, source.slice(valueStart, valueEnd.index), tool, key);
       found = true;
     }
-    cursor = valueEnd + DSML_XML_PARAMETER_END.length;
+    cursor = valueEnd.index + valueEnd.token.length;
   }
   if (!found && source.replace(/\s+/g, " ").trim()) {
     return { error: `unrecognized arguments for "${tool.name}"` };
@@ -1152,8 +1191,8 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
 // "function NAME") before the arguments.
 function stripDsmlFunctionPrefix(text) {
   return text
-    .replace(/^function\s*<\|tool[_\u2581]sep\|>\s*/i, "")
-    .replace(/^<\|tool[_\u2581]sep\|>\s*/i, "")
+    .replace(/^function\s*<[|\uFF5C]tool[_\u2581]sep[|\uFF5C]>\s*/i, "")
+    .replace(/^<[|\uFF5C]tool[_\u2581]sep[|\uFF5C]>\s*/i, "")
     .replace(/^function\s+/i, "");
 }
 
@@ -1226,16 +1265,31 @@ function partialTagLength(text, tag) {
 
 // Drops the DSML array wrappers from the stream. A token split across deltas
 // is held back until it is complete, so no half-token is emitted as text.
+// The model's spelling is canonicalized first: the pipe may be the fullwidth
+// U+FF5C and the XML dialect puts a space after it ("<｜DSML｜ calls>").
+const DSML_MARKERS = /<(\/?)\s*[|\uFF5C]\s*(DSML|tool)\s*[|\uFF5C]\s*/g;
+const DSML_PARTIAL_MARKER =
+  /<(\/?)\s*[|\uFF5C]\s*(?:D(?:S(?:M(?:L)?)?)?|t(?:o(?:o(?:l)?)?)?)?(?:\u2581[a-z]*)*\s*[|\uFF5C]?\s*$/;
+
+function normalizeDsmlMarkers(text) {
+  return text.replace(DSML_MARKERS, "<$1|$2|");
+}
+
+function partialDsmlMarkerLength(text) {
+  const match = DSML_PARTIAL_MARKER.exec(text);
+  return match ? text.length - match.index : 0;
+}
+
 function createNoiseFilter(tokens) {
   let carry = "";
   return {
     push(text) {
-      let data = carry + text;
+      let data = normalizeDsmlMarkers(carry + text);
       carry = "";
       for (const token of tokens) {
         data = data.split(token).join("");
       }
-      let keep = 0;
+      let keep = partialDsmlMarkerLength(data);
       for (const token of tokens) {
         keep = Math.max(keep, partialTagLength(data, token));
       }

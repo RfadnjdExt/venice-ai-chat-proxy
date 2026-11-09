@@ -523,7 +523,7 @@ How it works:
      `<|tool▁call▁end|>`, and Venice does not strip it, so without this it reached the client
      as ordinary content. The `<|tool▁calls▁begin|>`/`<|tool▁calls▁end|>` array wrapper and the
      ASCII-underscore spelling (`<|tool_call_begin|>`, `<|tool_sep|>`) are accepted too.
-     (The separator in the tokens is U+2581.)
+     (The separator in the tokens is U+2581; the pipes may be written as U+FF5C.)
    - the XML-ish DSML dialect that newer DeepSeek builds also emit, with the name and the
      arguments in attributes instead of a body:
      `<|DSML|calls>`<br>`<|DSML|invoke name="write">`<br>
@@ -532,6 +532,9 @@ How it works:
      `string="true"` keeps the value verbatim (quotes, backslashes and newlines included);
      without it the value is read as JSON. Several invokes in one `<|DSML|calls>` block, an
      invoke with no parameters, and a block cut off at the end of the stream are handled too.
+     The live model writes the pipe as the fullwidth U+FF5C and a space after it
+     (`<|DSML| invoke name="write">`); that spelling, and mixed ones, are accepted, also
+     across stream deltas.
 
    Raw newlines and tabs inside JSON strings are escaped before parsing, and stray closing
    tags after the JSON are ignored. A block cut off at the end of the stream is still tried,
