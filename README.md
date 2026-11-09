@@ -128,18 +128,42 @@ npm run login:google
 ```
 
 This launches your installed Chrome (or Edge/Chromium, or `VENICE_CHROME_PATH`) in a
-throwaway profile, opens `https://venice.ai/sign-in`, and waits for you to finish the
-Google sign-in in that window. Once the page reports an active Clerk session, the script
-captures the session token and the Venice/Clerk cookies, validates them against
+**persistent** profile, opens `https://venice.ai/sign-in`, and waits for you to finish
+the Google sign-in in that window. Once the page reports an active Clerk session, the
+script captures the session token and the Venice/Clerk cookies, validates them against
 `outerface.venice.ai`, writes the session file, and closes the browser.
+
+The profile is kept between runs, so the first run is the only one that needs a real
+Google sign-in; after that `npm run login:google` usually captures a fresh session with
+no interaction. The profile lives at `~/.venice-google-profile`
+(`%USERPROFILE%\.venice-google-profile` on Windows) and can be moved with
+`VENICE_GOOGLE_PROFILE_DIR`.
 
 - The default wait is 5 minutes; set `VENICE_GOOGLE_TIMEOUT_MS` to change it.
 - `npm run login -- --google --session-file .venice-web-session-google.json` writes a
   specific account file (the same flag used for multi-account setups).
+- `--fresh-profile` forgets the saved Google profile first, which is the way to switch to
+  a different Google account or recover from a locked/stale profile.
 - `VENICE_LOGIN_METHOD=google` makes the `npm start` fallback start this flow when no
   saved session can be restored.
 - `--google` is standalone: it cannot be combined with `--restore`, `--restore-only`,
   `--direct` or `--mfa-code` (Google handles its own second factor).
+
+##### Why not the normal Chrome profile?
+
+Reusing the profile you already use for browsing is not possible in Chrome 136+:
+
+- Chrome refuses to start a DevTools port when the data directory is the default one,
+  so the login cannot be driven on that profile.
+- A running Chrome cannot share its data directory with a second instance, so the login
+  cannot piggyback on the browser you already have open.
+- Copying the profile does not help either. Chrome 127+ on Windows encrypts every cookie
+  value with an App-Bound key; a copy loads the rows but cannot decrypt them, and Chrome
+  deletes them on exit (verified: 165 rows copied, 0 readable, 0 left).
+
+The persistent profile above is the practical equivalent: sign in to Google once and it
+behaves like your own profile for this tool, without weakening the browser's cookie
+encryption or exposing your browsing session to a debug port.
 
 Google login needs an interactive desktop session. On a headless server, run it on a
 machine with a browser and copy the resulting session file to the server.

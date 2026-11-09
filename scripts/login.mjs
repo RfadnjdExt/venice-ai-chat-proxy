@@ -219,6 +219,7 @@ async function main() {
   const restoreFlag = process.argv.includes("--restore");
   const restoreOnlyFlag = process.argv.includes("--restore-only");
   const directOnly = process.argv.includes("--direct");
+  const freshProfileFlag = process.argv.includes("--fresh-profile");
   const mfaFlag = process.argv.some(
     (arg) => arg === "--mfa-code" || arg.startsWith("--mfa-code="),
   );
@@ -247,17 +248,25 @@ async function main() {
     }
     // Google accounts have no Venice password; the browser completes the OAuth
     // handshake and this captures the resulting Clerk session.
-    const { loginWithGoogle } = await import("./login-google.mjs");
+    const { loginWithGoogle, resolveProfileDir } = await import("./login-google.mjs");
     const sessionFile =
       readSessionFileArg() || credentials.sessionFile || DEFAULT_SESSION_FILE;
     console.log(
       JSON.stringify(
-        await loginWithGoogle({ sessionFile: resolveSessionFile(sessionFile) }),
+        await loginWithGoogle({
+          sessionFile: resolveSessionFile(sessionFile),
+          freshProfile: freshProfileFlag,
+        }),
         null,
         2,
       ),
     );
+    console.error(`[login:google] profile kept at ${resolveProfileDir()}`);
     return;
+  }
+
+  if (freshProfileFlag) {
+    throw new Error("--fresh-profile only applies to --google.");
   }
 
   if (mfaFlag || process.env.VENICE_MFA_CODE?.trim()) {

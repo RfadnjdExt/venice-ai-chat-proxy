@@ -8,16 +8,27 @@ import { VeniceWebClient } from "../src/client.mjs";
 // Interactive Google (OAuth) login for accounts that have no Venice password.
 //
 // Clerk only lets the browser finish the Google handshake, so this launches a
-// real Chrome/Edge window against a throwaway profile, waits until the Venice
-// page reports an active Clerk session, and then captures the session token and
-// Venice/Clerk cookies. The rest of the login (user session lookup, snapshot
-// file) reuses the same VeniceWebClient path as the password flow.
+// real Chrome/Edge window, waits until the Venice page reports an active Clerk
+// session, and then captures the session token and Venice/Clerk cookies. The
+// rest of the login (user session lookup, snapshot file) reuses the same
+// VeniceWebClient path as the password flow.
+//
+// The browser profile is persistent (unlike a throwaway temp dir), so the Google
+// account and Venice cookies are remembered between runs. The first run needs a
+// real Google sign-in; later runs usually finish without any interaction.
+//
+// It cannot reuse the normal Chrome profile: Chrome 136+ refuses to open a
+// DevTools port on the default user-data-dir, a running Chrome cannot share its
+// profile, and copying the profile does not work either because Chrome encrypts
+// every cookie value with an App-Bound key (Chrome 127+) that only the original
+// profile can use. A persistent dedicated profile is the supported middle ground.
 
 const VENICE_ORIGIN = "https://venice.ai";
 const SIGN_IN_URL = `${VENICE_ORIGIN}/sign-in`;
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const SESSION_POLL_MS = 700;
 const COOKIE_DOMAIN_RE = /(^|\.)(venice\.ai|clerkprod-cloudflare\.net)$/i;
+const PROFILE_DIR_NAME = ".venice-google-profile";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -26,6 +37,17 @@ function sleep(ms) {
 function timeoutFromEnv() {
   const configured = Number(process.env.VENICE_GOOGLE_TIMEOUT_MS);
   return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_TIMEOUT_MS;
+}
+
+// A stable profile is what makes the Google login survive between runs. Point
+// VENICE_GOOGLE_PROFILE_DIR somewhere else to share one profile between checkouts
+// or to keep it out of the home directory.
+export function resolveProfileDir() {
+  const configured = process.env.VENICE_GOOGLE_PROFILE_DIR?.trim();
+  if (configured) {
+    return path.resolve(configured);
+  }
+  return path.join(os.homedir(), PROFILE_DIR_NAME);
 }
 
 function chromeCandidates() {
@@ -422,7 +444,7 @@ async function saveGoogleSession({ client, cookies, browserSession }) {
   };
 }
 
-export async function loginWithGoogle({ sessionFile, timeoutMs } = {}) {
+export async function loginWithGoogle({ sessionFile, timeoutMs, freshProfile = false } = {}) {
   const executable = findBrowserExecutable();
   if (!executable) {
     throw new Error(
@@ -430,16 +452,25 @@ export async function loginWithGoogle({ sessionFile, timeoutMs } = {}) {
     );
   }
 
-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "venice-google-login-"));
+  const profileDir = resolveProfileDir();
   const waitMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : timeoutFromEnv();
   const targetFile = sessionFile || ".venice-web-session.json";
 
+  if (freshProfile) {
+    fs.rmSync(profileDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+  }
+  const isNewProfile = !fs.existsSync(profileDir);
+  fs.mkdirSync(profileDir, { recursive: true });
+
   console.error(`[login:google] opening ${path.basename(executable)} at ${SIGN_IN_URL}`);
+  console.error(`[login:google] browser profile: ${profileDir}`);
   console.error(
-    `[login:google] complete the Google sign-in in that window; waiting up to ${Math.round(waitMs / 1000)}s for the session.`,
+    isNewProfile
+      ? `[login:google] first run: sign in to Google once in that window; the profile is kept for next time. Waiting up to ${Math.round(waitMs / 1000)}s.`
+      : `[login:google] reusing the saved profile; if the current session is still valid this finishes on its own. Waiting up to ${Math.round(waitMs / 1000)}s.`,
   );
 
-  const { child, wsUrl } = await launchBrowser(executable, userDataDir);
+  const { child, wsUrl } = await launchBrowser(executable, profileDir);
   const cdp = await CdpConnection.connect(wsUrl);
   const sessions = new Map();
 
@@ -473,7 +504,7 @@ export async function loginWithGoogle({ sessionFile, timeoutMs } = {}) {
 
     if (!signedInCookies) {
       throw new Error(
-        `Google sign-in did not complete within ${Math.round(waitMs / 1000)}s. Re-run the login and finish the Google flow in the opened window.`,
+        `Google sign-in did not complete within ${Math.round(waitMs / 1000)}s. Re-run the login and finish the Google flow in the opened window. Profile: ${profileDir}. If the window could not open, the profile may still be locked by another Chrome; close it or re-run with --fresh-profile.`,
       );
     }
 
@@ -488,7 +519,8 @@ export async function loginWithGoogle({ sessionFile, timeoutMs } = {}) {
 
     const client = new VeniceWebClient({ sessionFile: targetFile });
     try {
-      return await saveGoogleSession({ client, cookies, browserSession });
+      const result = await saveGoogleSession({ client, cookies, browserSession });
+      return { ...result, profileDir };
     } finally {
       await client.close();
     }
@@ -504,12 +536,8 @@ export async function loginWithGoogle({ sessionFile, timeoutMs } = {}) {
     } catch {
       // ignore
     }
-    // Chrome releases the profile lock a moment after exiting; ignore failures.
+    // Give Chrome a moment to flush the profile (cookies included) before the
+    // caller reports the saved session. The profile itself stays on disk.
     await sleep(300);
-    try {
-      fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-    } catch {
-      // leave the temporary profile for the OS to clean up
-    }
   }
 }

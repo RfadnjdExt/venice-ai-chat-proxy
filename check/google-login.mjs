@@ -6,6 +6,7 @@ import {
   extractVeniceCookies,
   findBrowserExecutable,
   readBrowserSession,
+  resolveProfileDir,
   toSessionCookie,
 } from "../scripts/login-google.mjs";
 import { VeniceWebClient } from "../src/client.mjs";
@@ -117,6 +118,33 @@ function testCookieSignal() {
     cookieSignalsLogin([{ name: "__client_uat", value: "1794295192" }]),
   );
   ok("blank __client_uat is not signed in", !cookieSignalsLogin([{ name: "__client_uat", value: " " }]));
+}
+
+function testProfileDir() {
+  section("resolveProfileDir");
+  const previous = process.env.VENICE_GOOGLE_PROFILE_DIR;
+  try {
+    delete process.env.VENICE_GOOGLE_PROFILE_DIR;
+    const fallback = resolveProfileDir();
+    ok("default profile is absolute", path.isAbsolute(fallback));
+    ok("default profile is named .venice-google-profile", path.basename(fallback) === ".venice-google-profile");
+    ok("default profile lives under the home directory", fallback.startsWith(os.homedir()));
+
+    process.env.VENICE_GOOGLE_PROFILE_DIR = path.join(os.tmpdir(), "custom-profile");
+    ok(
+      "VENICE_GOOGLE_PROFILE_DIR wins",
+      resolveProfileDir() === path.join(os.tmpdir(), "custom-profile"),
+    );
+
+    process.env.VENICE_GOOGLE_PROFILE_DIR = "  ";
+    ok("blank override falls back to the default", resolveProfileDir() === fallback);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.VENICE_GOOGLE_PROFILE_DIR;
+    } else {
+      process.env.VENICE_GOOGLE_PROFILE_DIR = previous;
+    }
+  }
 }
 
 function testEmailCapture() {
@@ -254,6 +282,7 @@ function main() {
   testCookieFiltering();
   testCookieSignal();
   testBrowserDiscovery();
+  testProfileDir();
   testEmailCapture();
   testBrowserSessionDetection()
     .then(() => {
