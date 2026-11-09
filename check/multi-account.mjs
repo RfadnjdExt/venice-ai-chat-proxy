@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createVeniceOpenAiProxy, discoverSessionFiles, isRateLimitError, parseRateLimitCooldown, VeniceAccount } from "../src/proxy.mjs";
 
 let passed = 0;
@@ -106,9 +109,61 @@ async function testPoolRotationAndFailover() {
   ok("error message notes all accounts exceeded", caught?.message?.includes("all 2 accounts"));
 }
 
+function testSessionDiscovery() {
+  section("Session file discovery");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "venice-discovery-"));
+  const primary = path.join(dir, ".venice-web-session.json");
+  const second = path.join(dir, ".venice-web-session-2.json");
+  const ignored = path.join(dir, "notes.json");
+  const listed = path.join(dir, "listed-account.json");
+
+  const previousSessionFile = process.env.VENICE_SESSION_FILE;
+  const previousSessionFiles = process.env.VENICE_SESSION_FILES;
+
+  try {
+    for (const file of [primary, second, ignored, listed]) {
+      fs.writeFileSync(file, "{}");
+    }
+
+    process.env.VENICE_SESSION_FILE = primary;
+    delete process.env.VENICE_SESSION_FILES;
+
+    const discovered = discoverSessionFiles();
+    ok("includes the configured session file", discovered.includes(primary));
+    ok("includes a sibling account file on the same volume", discovered.includes(second));
+    ok("ignores unrelated json next to it", !discovered.includes(ignored));
+
+    process.env.VENICE_SESSION_FILES = listed;
+    const withList = discoverSessionFiles();
+    ok("honours VENICE_SESSION_FILES", withList.includes(listed));
+    ok("keeps the configured file too", withList.includes(primary));
+
+    process.env.VENICE_SESSION_FILES = `${listed},${path.join(dir, "missing.json")}`;
+    const withMissing = discoverSessionFiles();
+    ok("skips a listed file that does not exist", !withMissing.some((f) => f.endsWith("missing.json")));
+
+    const proxy = createVeniceOpenAiProxy([primary, second]);
+    ok("a two-account pool loads both", proxy.accounts.length === 2);
+  } finally {
+    if (previousSessionFile === undefined) {
+      delete process.env.VENICE_SESSION_FILE;
+    } else {
+      process.env.VENICE_SESSION_FILE = previousSessionFile;
+    }
+    if (previousSessionFiles === undefined) {
+      delete process.env.VENICE_SESSION_FILES;
+    } else {
+      process.env.VENICE_SESSION_FILES = previousSessionFiles;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   testRateLimitHelper();
   await testPoolRotationAndFailover();
+  testSessionDiscovery();
 
   console.log(`\n────────────────────────────────────────\nResults: ${passed} passed, ${failed} failed\n`);
   if (failed > 0) {

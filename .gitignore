@@ -1,6 +1,6 @@
 *.har
 venice-login.json
-.venice-web-session.json
+.venice-web-session*.json
+sessions/
 node_modules/
-.venice-web-session.json
 venice-2fa-first-step.json

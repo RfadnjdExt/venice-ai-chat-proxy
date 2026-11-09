@@ -416,7 +416,22 @@ export function discoverSessionFiles() {
 
   const singleFile = process.env.VENICE_SESSION_FILE?.trim();
   if (singleFile) {
-    files.add(path.resolve(process.cwd(), singleFile));
+    const resolvedSingle = path.resolve(process.cwd(), singleFile);
+    files.add(resolvedSingle);
+
+    // Session files often live on a mounted volume (Docker: /data), where the
+    // cwd scan below cannot see them. Pick up sibling account files next to the
+    // configured one so adding an account only means adding a file.
+    try {
+      const dir = path.dirname(resolvedSingle);
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isFile() && /^\.venice-web-session.*\.json$/i.test(entry.name)) {
+          files.add(path.resolve(dir, entry.name));
+        }
+      }
+    } catch {
+      // ignore an unreadable or missing directory
+    }
   }
 
   try {

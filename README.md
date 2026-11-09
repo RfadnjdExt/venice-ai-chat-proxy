@@ -196,6 +196,54 @@ Google login needs an interactive desktop session. On a headless server, run it 
 machine with a browser and copy the resulting session file (or the `__client` cookie) to
 the server.
 
+##### Adding more accounts (without overwriting)
+
+One account is one session file. `--session-file` writes only to the file you name, so a
+second account never touches `.venice-web-session.json`:
+
+```powershell
+# password account
+node ./scripts/login.mjs --session-file .venice-web-session-work.json
+
+# Google account
+npm run login -- --google --session-file .venice-web-session-work.json
+
+# account added from a copied __client cookie
+node ./scripts/login.mjs --cookies-file work.json --session-file .venice-web-session-work.json
+```
+
+The pool picks up a file if it matches any one of these:
+
+- a file in the working directory named `.venice-web-session*.json`
+- any `*.json` inside `./sessions/`
+- a path listed in `VENICE_SESSION_FILES` (comma or semicolon separated)
+- a `.venice-web-session*.json` sibling of the configured `VENICE_SESSION_FILE` (this is
+  what makes a `/data` volume work in Docker)
+
+Restart the proxy after adding a file: accounts are discovered at startup, then requests
+round-robin across them and fail over to the next account on HTTP 429. `/support/info`
+lists the loaded accounts with their file, email and rate-limit state.
+
+Give each Google account its own browser profile. A persistent profile keeps one Google
+login, so a second `--google` run in the same profile would capture the first account
+again (and write it to the second file):
+
+```powershell
+$env:VENICE_GOOGLE_PROFILE_DIR = "$env:USERPROFILE\.venice-google-profile-work"
+npm run login -- --google --session-file .venice-web-session-work.json
+```
+
+`--fresh-profile` wipes the shared default profile, which logs out the accounts that use
+it; a separate `VENICE_GOOGLE_PROFILE_DIR` is the cleaner option. Cookie import does not
+have this problem because `__client` already identifies the account, with no profile
+involved.
+
+After a login, check that the new file holds the account you expected:
+
+```powershell
+node -e "console.log(require('./.venice-web-session-work.json').email)"
+```
+
 Optional modes:
 
 ```powershell
