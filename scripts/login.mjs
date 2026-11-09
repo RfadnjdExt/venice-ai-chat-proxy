@@ -221,15 +221,23 @@ async function main() {
     return;
   }
 
-  const email = process.env.VENICE_EMAIL?.trim() || credentials.email || await ask("Venice email: ");
-  const password = process.env.VENICE_PASSWORD || credentials.password || await askHidden("Venice password: ");
+  const email =
+    process.env.VENICE_EMAIL?.trim() ||
+    credentials.email ||
+    (restoreOnlyFlag ? "" : await ask("Venice email: "));
+  const password =
+    process.env.VENICE_PASSWORD ||
+    credentials.password ||
+    (restoreOnlyFlag ? "" : await askHidden("Venice password: "));
   const sessionFile = process.env.VENICE_SESSION_FILE?.trim() || credentials.sessionFile;
 
-  if (!email) {
-    throw new Error("Email is required.");
-  }
-  if (!password) {
-    throw new Error("Password is required.");
+  if (!restoreOnlyFlag) {
+    if (!email) {
+      throw new Error("Email is required.");
+    }
+    if (!password) {
+      throw new Error("Password is required.");
+    }
   }
 
   const client = new VeniceWebClient({

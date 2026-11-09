@@ -2123,6 +2123,18 @@ export function createVeniceOpenAiProxyServer(
         logOutgoingResponse({ req, url, status: overflow.status, durationMs: Date.now() - startedAt });
         return;
       }
+      const errStr = error instanceof Error ? error.message : String(error);
+      if (errStr.startsWith("HTTP 429:")) {
+        json(res, 429, {
+          error: {
+            message: "Venice rate limit exceeded (free quota reached). Please wait for quota reset.",
+            type: "invalid_request_error",
+            code: "rate_limit_exceeded",
+          },
+        });
+        logOutgoingResponse({ req, url, status: 429, durationMs: Date.now() - startedAt });
+        return;
+      }
       json(res, 500, {
         error: {
           message: error instanceof Error ? error.message : String(error),

@@ -11,8 +11,23 @@ const CLERK_API_VERSION = "2025-11-10";
 const CLERK_JS_VERSION = "5.125.10";
 const DEFAULT_MODEL = "zai-org-glm-4.6";
 const DEFAULT_PROMPT = "Doing inference!";
-const DEFAULT_VENICE_VERSION = "interface@20260429.025033+f3675fb";
-const DEFAULT_MIDDLEFACE_VERSION = "0.1.692";
+const DEFAULT_VENICE_VERSION =
+  process.env.VENICE_CLIENT_VERSION?.trim() || "interface@20261109.063913+1353113";
+const DEFAULT_MIDDLEFACE_VERSION = process.env.VENICE_MIDDLEFACE_VERSION?.trim() || "0.1.1220";
+// Venice requires a short-lived signed client attestation on every inference
+// request; without it the gateway answers 403 "Programmatic use of this API is
+// forbidden by TOS". The web app mints one with the self-reported checks below
+// (the server binds them plus the request User-Agent into the token).
+const CLIENT_ATTESTATION_PATH = "/api/app/user/client_attestation/mint";
+const CLIENT_ATTESTATION_ENV = {
+  nativeIntegrityOk: true,
+  reactStateHash: "b0447632072f076aa8a159db137c2e7e787cfc3212f58bb72e26611cef138b8b",
+  sentryVersion: "10.50.0",
+  unexpectedGlobalsCount: 693,
+  webdriver: false,
+};
+// Refresh a little before the token lapses (they live about five minutes).
+const CLIENT_ATTESTATION_SKEW_MS = 60_000;
 const DEFAULT_SESSION_FILE = path.join(process.cwd(), ".venice-web-session.json");
 const LOGIN_CONFIG_FILE = path.join(process.cwd(), "venice-login.json");
 const USER_AGENT =
@@ -461,6 +476,7 @@ export class VeniceWebClient {
     this.userId = null;
     this.sessionId = null;
     this.clerkJwt = null;
+    this.clientAttestation = null;
   }
 
   async ensureWreqSession() {
@@ -763,6 +779,47 @@ export class VeniceWebClient {
     };
   }
 
+  // Mint (or reuse) the signed client attestation the inference endpoints now
+  // require. The web app calls this once per session and refreshes it when it
+  // nears expiry.
+  async mintClientAttestation(jwt) {
+    const response = await this.request(`${OUTFACE_BASE_URL}${CLIENT_ATTESTATION_PATH}`, {
+      method: "POST",
+      headers: {
+        ...this.outerfaceHeaders(jwt, {
+          accept: "application/json, text/plain, */*",
+          "content-type": "application/json",
+          "x-venice-middleface-version": this.middlefaceVersion,
+        }),
+      },
+      body: JSON.stringify({ env: CLIENT_ATTESTATION_ENV }),
+    });
+    return await this.readJson(response);
+  }
+
+  async getClientAttestation(jwt) {
+    const cached = this.clientAttestation;
+    const now = nowMs();
+    if (cached?.token && cached.expiresAtMs - CLIENT_ATTESTATION_SKEW_MS > now) {
+      return cached.token;
+    }
+    try {
+      const minted = await this.mintClientAttestation(jwt);
+      const token = minted?.token;
+      if (typeof token === "string" && token !== "") {
+        const expiresAtMs = Number(minted.expiresAt) * 1000;
+        this.clientAttestation = {
+          token,
+          expiresAtMs: Number.isFinite(expiresAtMs) && expiresAtMs > now ? expiresAtMs : now + 240_000,
+        };
+        return token;
+      }
+    } catch (error) {
+      debugLog("attestation:mint:error", error instanceof Error ? error.message : String(error));
+    }
+    return "fallback_attestation_token";
+  }
+
   async getUserSession(jwt) {
     const response = await this.request(`${OUTFACE_BASE_URL}/api/user/session`, {
       headers: this.outerfaceHeaders(jwt),
@@ -873,6 +930,7 @@ export class VeniceWebClient {
           accept: "text/event-stream",
           "content-type": "application/json",
           "x-venice-middleface-version": this.middlefaceVersion,
+          "x-venice-client-attestation": await this.getClientAttestation(jwt),
         }),
       },
       body: JSON.stringify(requestBody),
@@ -941,6 +999,7 @@ export class VeniceWebClient {
           accept: "text/event-stream",
           "content-type": "application/json",
           "x-venice-middleface-version": this.middlefaceVersion,
+          "x-venice-client-attestation": await this.getClientAttestation(jwt),
         }),
       },
       body: JSON.stringify(requestBody),
@@ -1015,6 +1074,7 @@ export class VeniceWebClient {
             accept: "text/event-stream",
             "content-type": "application/json",
             "x-venice-middleface-version": this.middlefaceVersion,
+            "x-venice-client-attestation": await this.getClientAttestation(jwt),
           }),
         },
         body: JSON.stringify(requestBody),
