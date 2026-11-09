@@ -534,7 +534,9 @@ How it works:
      invoke with no parameters, and a block cut off at the end of the stream are handled too.
      The live model writes the pipe as the fullwidth U+FF5C and a space after it
      (`<|DSML| invoke name="write">`); that spelling, and mixed ones, are accepted, also
-     across stream deltas.
+     across stream deltas. Closing tags may put the slash after the pipe
+     (`<|/DSML|parameter>`). A single parameter named `arguments` whose value is an object
+     is unwrapped into the call's arguments.
 
    Raw newlines and tabs inside JSON strings are escaped before parsing, and stray closing
    tags after the JSON are ignored. A block cut off at the end of the stream is still tried,

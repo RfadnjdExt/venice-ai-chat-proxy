@@ -1791,6 +1791,59 @@ function testDsml() {
   ok("streamed live-spelled XML DSML parameter kept verbatim",
     args(spacedStream.calls[0]).content === fileContent);
   ok("streamed live-spelled XML DSML leaves no stray text", spacedStream.text === "");
+
+  // Closing tags may put the slash after the pipe: "<|/DSML|parameter>".
+  const slashClose = parse(
+    `${XB}${XI("get_weather")}<|DSML|parameter name="city" string="true">Paris<|/DSML|parameter>${XIE}${XE}`,
+  );
+  ok("slash-after-pipe parameter close parsed", slashClose.toolCalls.length === 1);
+  ok("slash-after-pipe parameter value parsed", args(slashClose.toolCalls[0]).city === "Paris");
+
+  const slashInvoke = parse(
+    `${XB}${XI("get_weather")}<|DSML|parameter name="city" string="true">Rome<|/DSML|parameter><|/DSML|invoke><|/DSML|calls>`,
+  );
+  ok("slash-after-pipe invoke and wrapper closes parsed", slashInvoke.toolCalls.length === 1);
+  ok("slash-after-pipe wrapper leaves no content", slashInvoke.content === null);
+
+  const slashStream = feed(
+    `${XB}${XI("get_weather")}<|DSML|parameter name="city" string="true">Oslo<|/DSML|parameter><|/DSML|invoke><|/DSML|calls>`,
+    { chunkSize: 1 },
+  );
+  ok("streamed slash-after-pipe close parsed", slashStream.calls.length === 1 && args(slashStream.calls[0]).city === "Oslo");
+
+  // A whole argument object wrapped in one "arguments" parameter is unwrapped.
+  const wrappedArgs = parse(
+    `${XB}${XI("get_weather")}<|DSML|parameter name="arguments" string="false">{"city":"Lima"}</|DSML|parameter>${XIE}${XE}`,
+  );
+  ok("arguments-wrapper parameter is unwrapped", wrappedArgs.toolCalls.length === 1);
+  ok("arguments-wrapper value parsed", args(wrappedArgs.toolCalls[0]).city === "Lima");
+
+  // The live failure: an empty "arguments" wrapper must become an invalid block
+  // (and be retried), never a delivered call.
+  const shellTool = {
+    name: "shell",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" }, workdir: { type: "string" } },
+      required: ["command"],
+    },
+  };
+  const shellWarnings = [];
+  const shellCase = parseToolCalls(
+    `${XB}${XI("shell")}<|DSML|parameter name="arguments" string="false">{}</|DSML|parameter>${XIE}${XE}`,
+    [shellTool],
+    { onWarning: (warning) => shellWarnings.push(warning) },
+  );
+  ok("empty arguments wrapper is invalid, not delivered", shellCase.toolCalls.length === 0);
+  ok("empty arguments wrapper warns", shellWarnings.length === 1 && /missing required/.test(shellWarnings[0].reason));
+
+  // The same block with a real command is delivered once unwrapped.
+  const shellOk = parseToolCalls(
+    `${XB}${XI("shell")}<|DSML|parameter name="arguments" string="false">{"command":"git status"}</|DSML|parameter>${XIE}${XE}`,
+    [shellTool],
+  );
+  ok("arguments-wrapper shell call parsed", shellOk.toolCalls.length === 1);
+  ok("arguments-wrapper shell command parsed", args(shellOk.toolCalls[0]).command === "git status");
 }
 
 async function main() {

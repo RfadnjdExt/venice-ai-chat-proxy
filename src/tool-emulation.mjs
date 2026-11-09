@@ -1184,6 +1184,16 @@ function parseDsmlInvoke(openTag, body, tools, { terminated = true } = {}) {
   if (!found && source.replace(/\s+/g, " ").trim()) {
     return { error: `unrecognized arguments for "${tool.name}"` };
   }
+  // Some builds wrap the whole argument object in one parameter named
+  // "arguments"; unwrap it unless the tool really declares that name.
+  const declared = tool.parameters?.properties;
+  if (
+    Object.keys(parsedArgs).length === 1 &&
+    isPlainObject(parsedArgs.arguments) &&
+    !(isPlainObject(declared) && Object.hasOwn(declared, "arguments"))
+  ) {
+    return buildToolCall(tool, parsedArgs.arguments);
+  }
   return buildToolCall(tool, parsedArgs);
 }
 
@@ -1266,13 +1276,18 @@ function partialTagLength(text, tag) {
 // Drops the DSML array wrappers from the stream. A token split across deltas
 // is held back until it is complete, so no half-token is emitted as text.
 // The model's spelling is canonicalized first: the pipe may be the fullwidth
-// U+FF5C and the XML dialect puts a space after it ("<｜DSML｜ calls>").
+// U+FF5C, the XML dialect puts a space after it ("<｜DSML｜ calls>"), and closing
+// tags are sometimes written with the slash after the pipe
+// ("<|/DSML|parameter>") instead of before it.
 const DSML_MARKERS = /<(\/?)\s*[|\uFF5C]\s*(DSML|tool)\s*[|\uFF5C]\s*/g;
+const DSML_MARKERS_SLASH_AFTER_PIPE = /<[|\uFF5C]\s*\/\s*(DSML|tool)\s*[|\uFF5C]\s*/g;
 const DSML_PARTIAL_MARKER =
-  /<(\/?)\s*[|\uFF5C]\s*(?:D(?:S(?:M(?:L)?)?)?|t(?:o(?:o(?:l)?)?)?)?(?:\u2581[a-z]*)*\s*[|\uFF5C]?\s*$/;
+  /<(?:\/\s*[|\uFF5C]|[|\uFF5C]\s*\/?)\s*(?:D(?:S(?:M(?:L)?)?)?|t(?:o(?:o(?:l)?)?)?)?(?:\u2581[a-z]*)*\s*[|\uFF5C]?\s*$/;
 
 function normalizeDsmlMarkers(text) {
-  return text.replace(DSML_MARKERS, "<$1|$2|");
+  return text
+    .replace(DSML_MARKERS_SLASH_AFTER_PIPE, "</|$1|")
+    .replace(DSML_MARKERS, "<$1|$2|");
 }
 
 function partialDsmlMarkerLength(text) {
