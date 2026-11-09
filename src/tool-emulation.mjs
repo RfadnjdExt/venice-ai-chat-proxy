@@ -20,6 +20,40 @@ const CALL_TAGS = [
   { open: PROXY_OPEN_TAG, close: PROXY_CLOSE_TAG, wrapper: true },
   { open: "<function=", close: "</function>", wrapper: false },
 ];
+
+// DeepSeek's native call syntax (DSML). One call is
+//   <|tool▁call▁begin|>function<|tool▁sep|>NAME
+//   ```json
+//   {...}
+//   ```
+//   <|tool▁call▁end|>
+// and the array form wraps those in <|tool▁calls▁begin|>…<|tool▁calls▁end|>.
+// The tokens are written with U+2581, and some servers render them with ASCII
+// underscores instead, so both spellings are accepted. DeepSeek falls back to
+// this format even when the prompt asks for <tool_call> JSON, and Venice does
+// not strip it, so without these tags a call reaches the client as content.
+const DSML_SEP = "<|tool\u2581sep|>";
+const DSML_CALL_BEGIN = "<|tool\u2581call\u2581begin|>";
+const DSML_CALL_END = "<|tool\u2581call\u2581end|>";
+const DSML_CALLS_BEGIN = "<|tool\u2581calls\u2581begin|>";
+const DSML_CALLS_END = "<|tool\u2581calls\u2581end|>";
+const DSML_OPEN = [
+  {
+    open: DSML_CALL_BEGIN,
+    close: [DSML_CALL_END, "<|tool_call_end|>"],
+    wrapper: true,
+    complete: true,
+  },
+  {
+    open: "<|tool_call_begin|>",
+    close: [DSML_CALL_END, "<|tool_call_end|>"],
+    wrapper: true,
+    complete: true,
+  },
+];
+CALL_TAGS.push(...DSML_OPEN);
+// Array wrappers carry no call of their own; they are dropped from the stream.
+const DSML_NOISE = [DSML_CALLS_BEGIN, DSML_CALLS_END, "<|tool_calls_begin|>", "<|tool_calls_end|>"];
 const SNIPPET_MAX_CHARS = 200;
 
 export function parseToolEmulationSetting(value) {
@@ -956,8 +990,17 @@ function parseGlmArgsWithoutKeyTags(tool, rest, terminated) {
 // Whatever follows the tool name: GLM pairs, Qwen parameters, a JSON object,
 // or a hybrid of a key tag and JSON.
 function parseCallArguments(tool, rest, terminated) {
+  // A DSML call may put the separator between the name and the arguments.
+  rest = rest.replace(/^\s*<\|tool[_\u2581]sep\|>\s*/, "");
   if (!rest.trim()) {
     return buildToolCall(tool, {});
+  }
+  // DSML puts the arguments in a fenced block after the name.
+  if (rest.trim().startsWith("```")) {
+    const inner = stripFence(rest.trim());
+    if (inner !== rest.trim()) {
+      return parseJsonArgs(tool, inner);
+    }
   }
   if (rest.startsWith("{")) {
     return parseJsonArgs(tool, rest);
@@ -984,7 +1027,7 @@ function parseCallArguments(tool, rest, terminated) {
 // XML, with or without the closing </function>).
 function parseNamedCall(body, tools, terminated) {
   const fn = /^<\s*function\s*=\s*([^>\s]+)\s*>\s*/.exec(body);
-  const match = fn ?? /^([^\s<{"]+)\s*/.exec(body);
+  const match = fn ?? /^([^\s<{`"|]+)\s*/.exec(body);
   if (!match) {
     return { error: "missing tool name" };
   }
@@ -1004,12 +1047,21 @@ function parseNamedCall(body, tools, terminated) {
   return parseCallArguments(tool, rest, terminated);
 }
 
+// DSML writes "function<|tool▁sep|>NAME" (sometimes just "<|tool▁sep|>NAME" or
+// "function NAME") before the arguments.
+function stripDsmlFunctionPrefix(text) {
+  return text
+    .replace(/^function\s*<\|tool[_\u2581]sep\|>\s*/i, "")
+    .replace(/^<\|tool[_\u2581]sep\|>\s*/i, "")
+    .replace(/^function\s+/i, "");
+}
+
 // Parses the inside of a call block, whatever format the model used.
 // `terminated` is false for a block cut off at the end of the stream.
 // Returns { toolCall } or { error }.
 export function parseCallBody(raw, tools, { terminated = true } = {}) {
   const index = indexTools(tools);
-  const body = stripFence(String(raw).trim());
+  const body = stripFence(stripDsmlFunctionPrefix(String(raw).trim()));
   return body.startsWith("{") ? parseJsonCall(body, index) : parseNamedCall(body, index, terminated);
 }
 
@@ -1071,6 +1123,32 @@ function partialTagLength(text, tag) {
   return 0;
 }
 
+// Drops the DSML array wrappers from the stream. A token split across deltas
+// is held back until it is complete, so no half-token is emitted as text.
+function createNoiseFilter(tokens) {
+  let carry = "";
+  return {
+    push(text) {
+      let data = carry + text;
+      carry = "";
+      for (const token of tokens) {
+        data = data.split(token).join("");
+      }
+      let keep = 0;
+      for (const token of tokens) {
+        keep = Math.max(keep, partialTagLength(data, token));
+      }
+      carry = data.slice(data.length - keep);
+      return data.slice(0, data.length - keep);
+    },
+    end() {
+      // Only a cut-off token can be left; dropping it beats leaking markup.
+      carry = "";
+      return "";
+    },
+  };
+}
+
 // Incremental parser for streamed content. push()/end() return events:
 //   { type: "text", text }           answer text, passed on as soon as it
 //                                    cannot be part of a tag
@@ -1095,6 +1173,7 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
   // newlines; it is flushed with the next text or at the end.
   let pendingWhitespace = "";
   let events = [];
+  const noise = createNoiseFilter(DSML_NOISE);
 
   const emitText = (text) => {
     if (!text || toolCallCount > 0) {
@@ -1159,7 +1238,7 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
           // wrapper closers (e.g. </tool_call> after a bare <function=…>)
           // are skipped.
           const trimmed = buffer.trimStart().replace(/^(?:<\/(?:tool_call|proxy_call)>\s*)+/, "");
-          if (!trimmed || CALL_TAGS.some((tag) => tag.wrapper && tag.close.startsWith(trimmed))) {
+          if (!trimmed || CALL_TAGS.some((tag) => [].concat(tag.close).some((close) => close.startsWith(trimmed)))) {
             buffer = trimmed;
             return;
           }
@@ -1193,6 +1272,15 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
           mode = "tag";
           continue;
         }
+        // DSML's opening token is the whole tag; there is no separate ">".
+        if (tag.complete) {
+          emitText(buffer.slice(0, index));
+          openTagText = tag.open;
+          buffer = buffer.slice(index + tag.open.length);
+          currentTag = tag;
+          mode = "tag";
+          continue;
+        }
         const after = buffer.slice(index + tag.open.length);
         const close = /^\s*>/.exec(after);
         if (close) {
@@ -1216,15 +1304,24 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
       }
 
       // mode === "tag"; a bare <function=…> block keeps its tag in the body.
-      const closeIndex = buffer.indexOf(currentTag.close);
+      const closes = [].concat(currentTag.close);
+      let closeIndex = -1;
+      let closeToken = closes[0];
+      for (const token of closes) {
+        const at = buffer.indexOf(token);
+        if (at !== -1 && (closeIndex === -1 || at < closeIndex)) {
+          closeIndex = at;
+          closeToken = token;
+        }
+      }
       if (closeIndex === -1) {
         return;
       }
-      const end = closeIndex + currentTag.close.length;
+      const end = closeIndex + closeToken.length;
       const body = currentTag.wrapper ? buffer.slice(0, closeIndex) : buffer.slice(0, end);
       buffer = buffer.slice(end);
       mode = "text";
-      emitCall(parseCallBody(body, known), currentTag.wrapper ? `${openTagText}${body}${currentTag.close}` : body);
+      emitCall(parseCallBody(body, known), currentTag.wrapper ? `${openTagText}${body}${closeToken}` : body);
     }
   };
 
@@ -1241,7 +1338,7 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
 
     push(text) {
       if (!stopped && typeof text === "string" && text) {
-        buffer += text;
+        buffer += noise.push(text);
         scan();
       }
       return drain();
@@ -1251,6 +1348,7 @@ export function createToolCallParser(tools, { maxCalls = Infinity } = {}) {
       if (stopped) {
         return drain();
       }
+      buffer += noise.end();
       if (mode === "hold") {
         const fallback = parseUntaggedCall(buffer, known);
         if (fallback.toolCall || fallback.error) {

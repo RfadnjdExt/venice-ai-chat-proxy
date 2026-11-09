@@ -1307,16 +1307,16 @@ async function testProxyWiring() {
   let upstream = null;
   let chatEvents = [];
   let agentEvents = [];
-  proxy.client.chat = async (_jwt, _input, options) => {
+  let chatStreamRead = 0;
+  let chatStreamClosedEarly = false;
+  const stubChat = async (_jwt, _input, options) => {
     upstream = options;
     return {
       events: chatEvents,
       text: chatEvents.filter((event) => event.kind === "content").map((event) => event.content ?? "").join(""),
     };
   };
-  let chatStreamRead = 0;
-  let chatStreamClosedEarly = false;
-  proxy.client.openChatStream = async (_jwt, _input, options) => {
+  const stubChatStream = async (_jwt, _input, options) => {
     upstream = options;
     chatStreamRead = 0;
     chatStreamClosedEarly = false;
@@ -1335,10 +1335,19 @@ async function testProxyWiring() {
       })(),
     };
   };
-  proxy.client.openAgentChatStream = async (_jwt, messages) => {
+  const stubAgentStream = async (_jwt, messages) => {
     upstream = messages;
     return { events: (async function* () { yield* agentEvents; })() };
   };
+  // Stub every account, not only the one that is active at start: the pool
+  // rotates per request, so a discoverable sibling session file would send the
+  // later requests to the real client (401) and fail the rest of this check.
+  const clients = new Set([proxy.client, ...proxy.accounts.map((account) => account.client)]);
+  for (const client of clients) {
+    client.chat = stubChat;
+    client.openChatStream = stubChatStream;
+    client.openAgentChatStream = stubAgentStream;
+  }
 
   const server = createVeniceOpenAiProxyServer(proxy);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -1527,15 +1536,24 @@ async function testProxyWiring() {
         [{ kind: "content", reasoning_content: "Calling the tool." }, { kind: "content", content: "\n\n" }],
         [{ kind: "content", content: '<proxy_call>{"name": "get_weather", "arguments": {"city": "Rome"}}</proxy_call>' }],
       ];
-      const original = proxy.client.openChatStream;
-      proxy.client.openChatStream = async (_jwt, _input, options) => {
+      const originals = [...clients].map((client) => [client, client.openChatStream]);
+      const sequence = async (_jwt, _input, options) => {
         upstream = options;
         const events = emptyThenCall[Math.min(attempt, 1)];
         attempt += 1;
         return { events: (async function* () { yield* events; })() };
       };
-      const response = await post({ model: "qwen3-6-27b", stream, messages: history, tools: [WEATHER_TOOL] }, { "x-venice-tool-debug": "1" });
-      proxy.client.openChatStream = original;
+      for (const client of clients) {
+        client.openChatStream = sequence;
+      }
+      let response;
+      try {
+        response = await post({ model: "qwen3-6-27b", stream, messages: history, tools: [WEATHER_TOOL] }, { "x-venice-tool-debug": "1" });
+      } finally {
+        for (const [client, original] of originals) {
+          client.openChatStream = original;
+        }
+      }
       const calls = stream
         ? parseSse(response.text).flatMap((chunk) => chunk?.choices?.[0]?.delta?.tool_calls ?? [])
         : JSON.parse(response.text).choices[0].message.tool_calls ?? [];
@@ -1615,6 +1633,66 @@ async function testProxyWiring() {
 // Entry point
 // ──────────────────────────────────────────────
 
+function testDsml() {
+  section("DeepSeek DSML");
+
+  const TOOL_SEP = "<|tool\u2581sep|>";
+  const CALL_BEGIN = "<|tool\u2581call\u2581begin|>";
+  const CALL_END = "<|tool\u2581call\u2581end|>";
+  const CALLS_BEGIN = "<|tool\u2581calls\u2581begin|>";
+  const CALLS_END = "<|tool\u2581calls\u2581end|>";
+  const FENCE = "```";
+
+  const dsmlCall = (name, args, { fence = true } = {}) => {
+    const body = fence ? `${FENCE}json\n${JSON.stringify(args)}\n${FENCE}` : JSON.stringify(args);
+    return `${CALL_BEGIN}function${TOOL_SEP}${name}\n${body}${CALL_END}`;
+  };
+
+  const single = parse(`Let me check.\n\n${dsmlCall("get_weather", { city: "Paris" })}`);
+  ok("unicode DSML call parsed", single.toolCalls.length === 1);
+  ok("DSML arguments parsed", single.toolCalls[0] && args(single.toolCalls[0]).city === "Paris");
+  ok("text before a DSML call is kept", single.content === "Let me check.");
+  ok("DSML markup never leaks as content", !String(single.content).includes("tool"));
+
+  const wrapped = parse(`${CALLS_BEGIN}${dsmlCall("read_file", { path: "src/a.js" })}${CALLS_END}`);
+  ok("DSML array wrapper parsed", wrapped.toolCalls.length === 1);
+  ok("DSML array wrapper leaves no content", wrapped.content === null);
+  ok("DSML path argument round-trips", args(wrapped.toolCalls[0]).path === "src/a.js");
+
+  const multiple = parse(
+    `${CALLS_BEGIN}${dsmlCall("read_file", { path: "a" })}\n${dsmlCall("get_weather", { city: "Rome" })}${CALLS_END}`,
+  );
+  ok("multiple DSML calls parsed in order",
+    multiple.toolCalls.map((call) => call.function.name).join(",") === "read_file,get_weather");
+  ok("multiple DSML calls leave no content", multiple.content === null);
+
+  const ascii = parse(
+    '<|tool_calls_begin|><|tool_call_begin|>function<|tool_sep|>get_weather\n```json\n{"city":"Oslo"}\n```<|tool_call_end|><|tool_calls_end|>',
+  );
+  ok("ASCII DSML tokens parsed", ascii.toolCalls.length === 1 && args(ascii.toolCalls[0]).city === "Oslo");
+
+  const bareJson = parse(`${CALL_BEGIN}function${TOOL_SEP}get_weather\n{"city":"Kyiv"}${CALL_END}`);
+  ok("DSML without a fence parsed", bareJson.toolCalls.length === 1 && args(bareJson.toolCalls[0]).city === "Kyiv");
+
+  const sepAfterName = parse(`${CALL_BEGIN}function${TOOL_SEP}get_weather${TOOL_SEP}{"city":"Lima"}${CALL_END}`);
+  ok("DSML separator after the name parsed", sepAfterName.toolCalls.length === 1 && args(sepAfterName.toolCalls[0]).city === "Lima");
+
+  const unknown = parse(`${CALL_BEGIN}function${TOOL_SEP}delete_everything\n{"x":1}${CALL_END}`);
+  ok("unknown DSML tool is a warning, not a call", unknown.toolCalls.length === 0 && unknown.warnings.length === 1);
+
+  const streamed = feed(`${CALLS_BEGIN}${dsmlCall("get_weather", { city: "Paris" })}${CALLS_END}`, { chunkSize: 1 });
+  ok("streamed DSML call parsed one byte at a time", streamed.calls.length === 1);
+  ok("streamed DSML arguments parsed", args(streamed.calls[0]).city === "Paris");
+  ok("streamed DSML leaves no stray text", streamed.text === "");
+
+  const streamedMulti = feed(
+    `Thinking...\n${CALLS_BEGIN}${dsmlCall("read_file", { path: "a" })}\n${dsmlCall("get_weather", { city: "Rome" })}${CALLS_END}`,
+    { chunkSize: 5 },
+  );
+  ok("streamed DSML call array parsed", streamedMulti.calls.length === 2);
+  ok("streamed DSML keeps the message before the calls", streamedMulti.text.trim() === "Thinking...");
+}
+
 async function main() {
   testParser();
   testStreamingParser();
@@ -1626,6 +1704,7 @@ async function main() {
   testProxyFormat();
   testDollarPatterns();
   testTrailingNewlines();
+  testDsml();
   testOpencodeFixture();
   testCheckHelpers();
   await testRunToolEmulation();

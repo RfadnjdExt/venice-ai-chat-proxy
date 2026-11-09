@@ -517,7 +517,13 @@ How it works:
      (Qwen3-Coder sometimes drops it) and with missing `</parameter>` or `</function>` tags;
    - JSON inside the tag, also with the name on its own line first or inside `<function=…>`;
    - hybrids where a key tag runs into JSON: `<tool_call>NAME<arg_key>key": "value", ...}` or
-     `<parameter=key": "value", ...}`.
+     `<parameter=key": "value", ...}`;
+   - DeepSeek DSML, even when the prompt asked for `<tool_call>` JSON: DeepSeek falls back to
+     its native `<|tool▁call▁begin|>function<|tool▁sep|>NAME` + fenced JSON +
+     `<|tool▁call▁end|>`, and Venice does not strip it, so without this it reached the client
+     as ordinary content. The `<|tool▁calls▁begin|>`/`<|tool▁calls▁end|>` array wrapper and the
+     ASCII-underscore spelling (`<|tool_call_begin|>`, `<|tool_sep|>`) are accepted too.
+     (The separator in the tokens is U+2581.)
 
    Raw newlines and tabs inside JSON strings are escaped before parsing, and stray closing
    tags after the JSON are ignored. A block cut off at the end of the stream is still tried,
