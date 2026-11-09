@@ -26,7 +26,7 @@ The proxy translates OpenAI-style chat requests into Venice web requests, then t
 
 - Node.js 22 or newer
 - a Venice account
-- a saved session file, or valid `VENICE_EMAIL` and `VENICE_PASSWORD`
+- a saved session file, valid `VENICE_EMAIL` and `VENICE_PASSWORD`, or a Google account plus an installed Chrome/Edge for `npm run login:google`
 
 ## Project files
 
@@ -38,6 +38,7 @@ Main scripts in this repo:
 - `src/agentic.mjs`: agent/workflow endpoint support used by the proxy
 - `scripts/login.mjs`: local login utility that creates the session file (`npm run login`)
 - `scripts/login-wreq.mjs`: browserless Clerk login flow used by `scripts/login.mjs`
+- `scripts/login-google.mjs`: interactive Google/OAuth login flow used by `npm run login:google`
 - `scripts/convert.mjs`: transcript-to-import JSON converter (`npm run convert:chat`)
 - `scripts/deploy.sh`: builds and restarts the Compose service with the current commit stamped into the image
 - `check/models.mjs`: quick `/v1/models` smoke test (`npm run check:models`)
@@ -117,9 +118,36 @@ success the session file is written and the pending state file is deleted. Becau
 saved cookies mark the device as trusted, later logins usually skip the second factor.
 `VENICE_MFA_STATE_FILE` overrides the pending-state path.
 
+#### Google / OAuth accounts
+
+Accounts created with "Continue with Google" have no Venice password, so the browserless
+flow cannot sign them in. Use the interactive flow instead:
+
+```powershell
+npm run login:google
+```
+
+This launches your installed Chrome (or Edge/Chromium, or `VENICE_CHROME_PATH`) in a
+throwaway profile, opens `https://venice.ai/sign-in`, and waits for you to finish the
+Google sign-in in that window. Once the page reports an active Clerk session, the script
+captures the session token and the Venice/Clerk cookies, validates them against
+`outerface.venice.ai`, writes the session file, and closes the browser.
+
+- The default wait is 5 minutes; set `VENICE_GOOGLE_TIMEOUT_MS` to change it.
+- `npm run login -- --google --session-file .venice-web-session-google.json` writes a
+  specific account file (the same flag used for multi-account setups).
+- `VENICE_LOGIN_METHOD=google` makes the `npm start` fallback start this flow when no
+  saved session can be restored.
+- `--google` is standalone: it cannot be combined with `--restore`, `--restore-only`,
+  `--direct` or `--mfa-code` (Google handles its own second factor).
+
+Google login needs an interactive desktop session. On a headless server, run it on a
+machine with a browser and copy the resulting session file to the server.
+
 Optional modes:
 
 ```powershell
+npm run login:google
 npm run login:restore
 npm run login:restore-only
 npm run login:direct

@@ -767,10 +767,18 @@ export class VeniceWebClient {
     if (!session?.id) {
       return null;
     }
+    const user = session.user ?? null;
+    const primaryId = user?.primary_email_address_id ?? null;
+    const primaryAddress = Array.isArray(user?.email_addresses)
+      ? user.email_addresses.find((address) => address?.id === primaryId) ??
+        user.email_addresses[0] ??
+        null
+      : null;
     return {
       sessionId: session.id,
       userId: session.user?.id ?? null,
       lastActiveToken: session.last_active_token?.jwt ?? null,
+      email: primaryAddress?.email_address ?? null,
     };
   }
 
@@ -1190,6 +1198,9 @@ export class VeniceWebClient {
     if (restored.userId) {
       this.userId = restored.userId;
     }
+    if (restored.email) {
+      this.email = restored.email;
+    }
 
     let jwt = restored.lastActiveToken;
     const payload = decodeJwtPayload(jwt);
@@ -1229,10 +1240,13 @@ export class VeniceWebClient {
   writeSavedSession(extra = {}) {
     const payload = decodeJwtPayload(this.clerkJwt);
     const expiresAt = typeof payload?.exp === "number" ? payload.exp * 1000 : null;
+    // A restore may not know the email (outerface can answer with only a token),
+    // so keep the label already on disk instead of rewriting it as empty.
+    const previous = this.email ? null : this.readSavedSession();
     const snapshot = {
       savedAt: nowMs(),
       sessionFile: this.sessionFile,
-      email: this.email,
+      email: this.email || previous?.email || null,
       sessionId: this.sessionId,
       clerkJwt: this.clerkJwt,
       clerkJwtExpiresAt: expiresAt,
@@ -1260,6 +1274,11 @@ export class VeniceWebClient {
     }
     this.sessionId = typeof snapshot.sessionId === "string" ? snapshot.sessionId : null;
     this.clerkJwt = typeof snapshot.clerkJwt === "string" ? snapshot.clerkJwt : null;
+    // Keep the account label across restores; outerface does not always return
+    // the email, so the snapshot is the only place it can come from.
+    if (typeof snapshot.email === "string" && snapshot.email) {
+      this.email = snapshot.email;
+    }
     this.userId = typeof snapshot.userId === "string" ? snapshot.userId : null;
     this.userDistinctId =
       typeof snapshot.userDistinctId === "string" ? snapshot.userDistinctId : null;

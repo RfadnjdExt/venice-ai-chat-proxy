@@ -49,8 +49,12 @@ async function main() {
   const anyOk = restoreResults.some((r) => r.ok);
   if (!anyOk && sessionFiles.length <= 1) {
     console.error("Saved session restore failed. Running login utility...");
+    const fallbackArgs =
+      process.env.VENICE_LOGIN_METHOD?.trim().toLowerCase() === "google"
+        ? ["--google", `--session-file=${sessionFiles[0]}`]
+        : [`--session-file=${sessionFiles[0]}`];
     try {
-      const output = await runLoginUtility();
+      const output = await runLoginUtility(fallbackArgs);
       restoreResults.push({ sessionFile: sessionFiles[0], ok: true, data: JSON.parse(output) });
     } catch (e) {
       console.error(`Login failed: ${e.message}`);

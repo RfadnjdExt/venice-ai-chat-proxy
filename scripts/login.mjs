@@ -222,10 +222,41 @@ async function main() {
   const mfaFlag = process.argv.some(
     (arg) => arg === "--mfa-code" || arg.startsWith("--mfa-code="),
   );
+  // `VENICE_LOGIN_METHOD=google` is for the startup fallback only: an explicit
+  // --restore/--restore-only/--direct/--mfa-code run must keep its own mode.
+  const googleFlag =
+    process.argv.includes("--google") ||
+    (!restoreFlag &&
+      !restoreOnlyFlag &&
+      !directOnly &&
+      !mfaFlag &&
+      process.env.VENICE_LOGIN_METHOD?.trim().toLowerCase() === "google");
   const credentials = await readCredentialsFile();
 
   if (cleanSessionFlag) {
     console.log(JSON.stringify(await cleanSessionData(credentials), null, 2));
+    return;
+  }
+
+  if (googleFlag) {
+    if (mfaFlag || process.env.VENICE_MFA_CODE?.trim()) {
+      throw new Error("--google signs in through the browser, so --mfa-code does not apply.");
+    }
+    if (restoreOnlyFlag || restoreFlag || directOnly) {
+      throw new Error("--google cannot be combined with --restore, --restore-only or --direct.");
+    }
+    // Google accounts have no Venice password; the browser completes the OAuth
+    // handshake and this captures the resulting Clerk session.
+    const { loginWithGoogle } = await import("./login-google.mjs");
+    const sessionFile =
+      readSessionFileArg() || credentials.sessionFile || DEFAULT_SESSION_FILE;
+    console.log(
+      JSON.stringify(
+        await loginWithGoogle({ sessionFile: resolveSessionFile(sessionFile) }),
+        null,
+        2,
+      ),
+    );
     return;
   }
 
