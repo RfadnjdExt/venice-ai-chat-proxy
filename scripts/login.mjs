@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import { readFile, rm } from "node:fs/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { VeniceWebClient } from "../src/client.mjs";
+import { chooseSessionFile } from "./session-files.mjs";
 
 const CREDENTIALS_FILE = new URL("../venice-login.json", import.meta.url);
 const DEFAULT_SESSION_FILE = ".venice-web-session.json";
@@ -267,6 +268,9 @@ async function main() {
       process.env.VENICE_LOGIN_METHOD?.trim().toLowerCase() === "google");
   const credentials = await readCredentialsFile();
 
+  // Nothing explicit -> let the account decide which file to refresh or create.
+  const explicitSessionFile = readSessionFileArg() || credentials.sessionFile || null;
+
   if (cleanSessionFlag) {
     console.log(JSON.stringify(await cleanSessionData(credentials), null, 2));
     return;
@@ -303,11 +307,14 @@ async function main() {
       throw new Error(`No cookie input was provided.\n${cookieInputHint()}`);
     }
 
-    const sessionFile =
-      readSessionFileArg() || credentials.sessionFile || DEFAULT_SESSION_FILE;
+    const sessionFile = explicitSessionFile || DEFAULT_SESSION_FILE;
     console.log(
       JSON.stringify(
-        await loginWithCookies({ sessionFile: resolveSessionFile(sessionFile), text }),
+        await loginWithCookies({
+          sessionFile: resolveSessionFile(sessionFile),
+          text,
+          autoSessionFile: !explicitSessionFile,
+        }),
         null,
         2,
       ),
@@ -325,13 +332,13 @@ async function main() {
     // Google accounts have no Venice password; the browser completes the OAuth
     // handshake and this captures the resulting Clerk session.
     const { loginWithGoogle, resolveProfileDir } = await import("./login-google.mjs");
-    const sessionFile =
-      readSessionFileArg() || credentials.sessionFile || DEFAULT_SESSION_FILE;
+    const sessionFile = explicitSessionFile || DEFAULT_SESSION_FILE;
     console.log(
       JSON.stringify(
         await loginWithGoogle({
           sessionFile: resolveSessionFile(sessionFile),
           freshProfile: freshProfileFlag,
+          autoSessionFile: !explicitSessionFile,
         }),
         null,
         2,
@@ -371,7 +378,9 @@ async function main() {
     process.env.VENICE_PASSWORD ||
     credentials.password ||
     (restoreOnlyFlag ? "" : await askHidden("Venice password: "));
-  const sessionFile = readSessionFileArg() || credentials.sessionFile;
+  const sessionFile =
+    explicitSessionFile ||
+    (restoreOnlyFlag || restoreFlag ? null : chooseSessionFile({ email }));
 
   if (!restoreOnlyFlag) {
     if (!email) {

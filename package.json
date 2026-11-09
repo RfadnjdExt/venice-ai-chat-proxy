@@ -8,6 +8,7 @@
     "check:models": "node ./check/models.mjs",
     "check:multi-account": "node ./check/multi-account.mjs",
     "check:null-bytes": "node ./check/null-bytes.mjs",
+    "check:session-files": "node ./check/session-files.mjs",
     "check:openai-client": "node ./check/openai.mjs",
     "check:tool-emulation": "node ./check/tool-emulation.mjs",
     "check:tools": "node ./check/tools.mjs",

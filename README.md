@@ -142,7 +142,8 @@ no interaction. The profile lives at `~/.venice-google-profile`
 
 - The default wait is 5 minutes; set `VENICE_GOOGLE_TIMEOUT_MS` to change it.
 - `npm run login -- --google --session-file .venice-web-session-google.json` writes a
-  specific account file (the same flag used for multi-account setups).
+  specific account file. Without it the account picks the file: its own session file is
+  refreshed, or a new `.venice-web-session-N.json` is created.
 - `--fresh-profile` forgets the saved Google profile first, which is the way to switch to
   a different Google account or recover from a locked/stale profile.
 - `VENICE_LOGIN_METHOD=google` makes the `npm start` fallback start this flow when no
@@ -198,21 +199,24 @@ the server.
 
 ##### Adding more accounts (without overwriting)
 
-One account is one session file. `--session-file` writes only to the file you name, so a
-second account never touches `.venice-web-session.json`:
+One account is one session file, and you normally do not name it: the login reads the
+account identity (Clerk email, session id, user id) and then decides.
 
 ```powershell
-# password account
-node ./scripts/login.mjs --session-file .venice-web-session-work.json
-
-# Google account
-npm run login -- --google --session-file .venice-web-session-work.json
-
-# account added from a copied __client cookie
-node ./scripts/login.mjs --cookies-file work.json --session-file .venice-web-session-work.json
+npm run login                    # password account, target file chosen automatically
+npm run login:google             # Google account
+npm run login:cookies            # copied __client cookie
 ```
 
-The pool picks up a file if it matches any one of these:
+- The account already has a session file -> that file is refreshed in place.
+- It is a new account -> the next free name is used: `.venice-web-session-2.json`,
+  `-3`, and so on. A corrupt or empty file counts as free and is reused.
+- `--session-file <path>` (or `VENICE_SESSION_FILE`) still wins when you want a specific
+  file, and is the right flag for restore-only runs.
+
+New files land in the working directory, or next to the configured `VENICE_SESSION_FILE`
+when one is set (for a Docker `/data` volume). The pool picks up a file if it matches any
+one of these:
 
 - a file in the working directory named `.venice-web-session*.json`
 - any `*.json` inside `./sessions/`
@@ -226,11 +230,11 @@ lists the loaded accounts with their file, email and rate-limit state.
 
 Give each Google account its own browser profile. A persistent profile keeps one Google
 login, so a second `--google` run in the same profile would capture the first account
-again (and write it to the second file):
+again (auto-detection would then just refresh the first account's file, not add one):
 
 ```powershell
 $env:VENICE_GOOGLE_PROFILE_DIR = "$env:USERPROFILE\.venice-google-profile-work"
-npm run login -- --google --session-file .venice-web-session-work.json
+npm run login:google
 ```
 
 `--fresh-profile` wipes the shared default profile, which logs out the accounts that use
@@ -238,10 +242,10 @@ it; a separate `VENICE_GOOGLE_PROFILE_DIR` is the cleaner option. Cookie import 
 have this problem because `__client` already identifies the account, with no profile
 involved.
 
-After a login, check that the new file holds the account you expected:
+After a login, the JSON output and the file both name the account that was written:
 
 ```powershell
-node -e "console.log(require('./.venice-web-session-work.json').email)"
+node -e "console.log(require('./.venice-web-session.json').email)"
 ```
 
 Optional modes:
@@ -255,7 +259,7 @@ npm run login:direct
 npm run clean-session
 ```
 
-`--restore-only` refreshes from the saved session/cookies and never falls back to credential login. `--restore` keeps the older restore/direct fallback behavior for debugging. `--direct` uses the plain Node fetch implementation, which is useful for confirming Clerk bot/rate rejection but is not the normal login path. `--cookies-file <path>` / `--paste-cookies` build a session from a copied `__client` cookie without launching a browser. `--clean-session` removes saved Venice session files, including the configured `VENICE_SESSION_FILE` and the default `.venice-web-session.json`, without deleting `venice-login.json`.
+`--restore-only` refreshes from the saved session/cookies and never falls back to credential login; it also never creates a file, so pass `--session-file` when the working directory holds more than one account. `--restore` keeps the older restore/direct fallback behavior for debugging. `--direct` uses the plain Node fetch implementation, which is useful for confirming Clerk bot/rate rejection but is not the normal login path. `--cookies-file <path>` / `--paste-cookies` build a session from a copied `__client` cookie without launching a browser. `--clean-session` removes saved Venice session files, including the configured `VENICE_SESSION_FILE` and the default `.venice-web-session.json`, without deleting `venice-login.json`.
 
 ### Session caching
 

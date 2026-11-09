@@ -209,7 +209,7 @@ export function cookieInputHint() {
   ].join("\n");
 }
 
-export async function loginWithCookies({ sessionFile, text }) {
+export async function loginWithCookies({ sessionFile, text, autoSessionFile = false }) {
   const cookies = parseCookieInput(text);
   if (cookies.length === 0) {
     throw new Error(`No Venice cookies were found in the pasted value.\n${cookieInputHint()}`);
@@ -228,6 +228,7 @@ export async function loginWithCookies({ sessionFile, text }) {
       client,
       cookies,
       loginMethod: "cookie-import",
+      autoSessionFile,
     });
   } finally {
     await client.close();

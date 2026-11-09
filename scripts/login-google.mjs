@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { VeniceWebClient } from "../src/client.mjs";
+import { DEFAULT_SESSION_BASENAME, chooseSessionFile } from "./session-files.mjs";
 
 // Interactive Google (OAuth) login for accounts that have no Venice password.
 //
@@ -391,6 +392,7 @@ export async function saveCapturedSession({
   cookies,
   browserSession = null,
   loginMethod = "google",
+  autoSessionFile = false,
 }) {
   client.cookies.import(cookies);
   client.wreqSeeded = false;
@@ -438,6 +440,16 @@ export async function saveCapturedSession({
   client.userDistinctId =
     userSession?.id || userSession?.user?.id || client.userDistinctId || crypto.randomUUID();
 
+  // Only choose the target file once the account is known: refreshing an account
+  // updates its existing file, and a new account gets a fresh one.
+  if (autoSessionFile) {
+    client.sessionFile = chooseSessionFile({
+      email,
+      sessionId,
+      userId: client.userId,
+    });
+  }
+
   client.writeSavedSession({
     loginMethod,
     lastValidatedAt: Date.now(),
@@ -456,7 +468,12 @@ export async function saveCapturedSession({
   };
 }
 
-export async function loginWithGoogle({ sessionFile, timeoutMs, freshProfile = false } = {}) {
+export async function loginWithGoogle({
+  sessionFile,
+  timeoutMs,
+  freshProfile = false,
+  autoSessionFile = false,
+} = {}) {
   const executable = findBrowserExecutable();
   if (!executable) {
     throw new Error(
@@ -466,7 +483,9 @@ export async function loginWithGoogle({ sessionFile, timeoutMs, freshProfile = f
 
   const profileDir = resolveProfileDir();
   const waitMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : timeoutFromEnv();
-  const targetFile = sessionFile || ".venice-web-session.json";
+  const targetFile = sessionFile
+    ? path.resolve(process.cwd(), sessionFile)
+    : path.resolve(process.cwd(), DEFAULT_SESSION_BASENAME);
 
   if (freshProfile) {
     fs.rmSync(profileDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
@@ -531,7 +550,12 @@ export async function loginWithGoogle({ sessionFile, timeoutMs, freshProfile = f
 
     const client = new VeniceWebClient({ sessionFile: targetFile });
     try {
-      const result = await saveCapturedSession({ client, cookies, browserSession });
+      const result = await saveCapturedSession({
+        client,
+        cookies,
+        browserSession,
+        autoSessionFile,
+      });
       return { ...result, profileDir };
     } finally {
       await client.close();
