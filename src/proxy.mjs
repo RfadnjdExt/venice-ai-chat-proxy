@@ -32,6 +32,11 @@ const MODEL_OVERLOADED_RETRY_DELAY_MS = Number(
 const DEBUG = Boolean(process.env.VENICE_DEBUG?.trim());
 // Clerk JWTs live about a minute; refresh a little before they lapse.
 const AUTH_REFRESH_SKEW_MS = Number(process.env.VENICE_AUTH_REFRESH_SKEW_MS || 10_000);
+// Default poll interval for picking up added or removed session files.
+const DEFAULT_ACCOUNT_REFRESH_MS = 3000;
+// How often a running proxy rescans for added/removed session files. A new
+// account therefore joins the pool without a restart; 0 disables the scan.
+const ACCOUNT_REFRESH_MS = parseAccountRefreshInterval(process.env.VENICE_ACCOUNT_REFRESH_MS);
 const AGENTIC_MODEL_NAME = process.env.VENICE_AGENTIC_MODEL_NAME?.trim() || "agentic";
 // Prompt-based tool calling for requests that send `tools`; "off" restores the
 // old behavior of ignoring them.
@@ -399,6 +404,44 @@ export function parseRateLimitCooldown(error) {
   }
 
   return Date.now() + DEFAULT_COOLDOWN_MS;
+}
+
+// `VENICE_ACCOUNT_REFRESH_MS` is the poll interval for picking up added or
+// removed session files. Empty/unset uses the default; "off"/"0"/"false"/"no"
+// disables the scan; anything else non-numeric falls back to the default.
+export function parseAccountRefreshInterval(value) {
+  if (value === undefined || value === null) {
+    return DEFAULT_ACCOUNT_REFRESH_MS;
+  }
+  const text = String(value).trim().toLowerCase();
+  if (text === "") {
+    return DEFAULT_ACCOUNT_REFRESH_MS;
+  }
+  if (["off", "false", "no"].includes(text)) {
+    return 0;
+  }
+  const ms = Number(text);
+  if (Number.isFinite(ms) && ms >= 0) {
+    return ms;
+  }
+  return DEFAULT_ACCOUNT_REFRESH_MS;
+}
+
+// A login utility may still be writing the file when the scan runs, so only a
+// complete snapshot counts as a usable account.
+function readSessionSnapshot(file) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    if (parsed.sessionId || parsed.clerkJwt) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 export function discoverSessionFiles() {
@@ -1120,6 +1163,7 @@ export class VeniceOpenAiProxy {
     this.accounts = [];
     this.accountIndex = 0;
     this.currentAccount = null;
+    this.accountWatcher = null;
     this.refreshAccounts();
 
     // Per-model sampling defaults from Venice's encrypted model catalog, keyed
@@ -1128,8 +1172,11 @@ export class VeniceOpenAiProxy {
     this.modelSettingsLoadedAt = 0;
   }
 
-  refreshAccounts() {
-    const discovered = this.sessionFiles || discoverSessionFiles();
+  refreshAccounts(files) {
+    const discovered =
+      Array.isArray(files) && files.length > 0
+        ? files.map((file) => path.resolve(file))
+        : this.sessionFiles || discoverSessionFiles();
     const existingMap = new Map(this.accounts.map((acc) => [acc.sessionFile, acc]));
     const nextAccounts = [];
 
@@ -1146,9 +1193,118 @@ export class VeniceOpenAiProxy {
       nextAccounts.push(new VeniceAccount(path.resolve(process.cwd(), ".venice-web-session.json")));
     }
 
+    // Keep the rotation pointer on the same account across a rebuild so adding
+    // a file cannot make the next request repeat (or skip) an account.
+    const pointerAccount = this.accounts[this.accountIndex] ?? null;
+    const currentPath = this.currentAccount?.sessionFile ?? null;
+
     this.accounts = nextAccounts;
-    this.currentAccount = this.accounts[0];
+
+    let pointerIndex = pointerAccount ? nextAccounts.indexOf(pointerAccount) : -1;
+    if (pointerIndex < 0 && currentPath) {
+      pointerIndex = nextAccounts.findIndex((acc) => acc.sessionFile === currentPath);
+    }
+    this.accountIndex =
+      pointerIndex >= 0 ? pointerIndex : Math.max(0, Math.min(this.accountIndex, nextAccounts.length - 1));
+    this.currentAccount =
+      (currentPath && nextAccounts.find((acc) => acc.sessionFile === currentPath)) ||
+      nextAccounts[this.accountIndex] ||
+      nextAccounts[0];
     return this.accounts;
+  }
+
+  // Adds/removes accounts for the running pool without touching the cached
+  // auth of accounts that stay, and without dropping the pool when every file
+  // is momentarily unreadable (a login in progress). Returns what changed.
+  syncAccounts(files) {
+    const discovered = (
+      Array.isArray(files) && files.length > 0
+        ? files.map((file) => path.resolve(file))
+        : this.sessionFiles || discoverSessionFiles()
+    ).filter((file) => {
+      try {
+        return fs.existsSync(file);
+      } catch {
+        return false;
+      }
+    });
+    const ready = discovered.filter((file) => readSessionSnapshot(file));
+    if (ready.length === 0) {
+      return { added: [], removed: [] };
+    }
+
+    const before = new Map(this.accounts.map((acc) => [acc.sessionFile, acc]));
+    const readySet = new Set(ready);
+    const discoveredSet = new Set(discovered);
+    const added = ready.filter((file) => !before.has(file));
+    // Only a file that disappeared removes an account. A file that exists but
+    // cannot be read right now (the proxy rewriting it, a login half-done)
+    // keeps its place and its cached auth.
+    const removed = this.accounts
+      .filter((acc) => !discoveredSet.has(acc.sessionFile))
+      .map((acc) => acc.sessionFile);
+    if (added.length === 0 && removed.length === 0) {
+      return { added: [], removed: [] };
+    }
+
+    const pointerAccount = this.accounts[this.accountIndex] ?? null;
+    const currentPath = this.currentAccount?.sessionFile ?? null;
+
+    // Existing accounts are reused even when their file is momentarily
+    // unreadable; a new file is only added once it holds a complete snapshot.
+    const nextAccounts = discovered
+      .map((file) => before.get(file) ?? (readySet.has(file) ? new VeniceAccount(file) : null))
+      .filter(Boolean);
+    this.accounts = nextAccounts;
+
+    let pointerIndex = pointerAccount ? nextAccounts.indexOf(pointerAccount) : -1;
+    if (pointerIndex < 0 && currentPath) {
+      pointerIndex = nextAccounts.findIndex((acc) => acc.sessionFile === currentPath);
+    }
+    this.accountIndex =
+      pointerIndex >= 0 ? pointerIndex : Math.max(0, Math.min(this.accountIndex, nextAccounts.length - 1));
+    this.currentAccount =
+      (currentPath && nextAccounts.find((acc) => acc.sessionFile === currentPath)) ||
+      nextAccounts[this.accountIndex] ||
+      nextAccounts[0];
+
+    return { added, removed };
+  }
+
+  watchAccounts(intervalMs = ACCOUNT_REFRESH_MS) {
+    this.stopAccountWatcher();
+    const interval = Number(intervalMs);
+    if (!Number.isFinite(interval) || interval <= 0) {
+      return null;
+    }
+    this.accountWatcher = setInterval(() => {
+      try {
+        const { added, removed } = this.syncAccounts();
+        for (const file of added) {
+          console.log(`[${nowIso()}] account added to pool: ${path.basename(file)}`);
+        }
+        for (const file of removed) {
+          console.log(`[${nowIso()}] account removed from pool: ${path.basename(file)}`);
+        }
+      } catch (error) {
+        console.warn(
+          `[${nowIso()}] account refresh failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }, interval);
+    if (typeof this.accountWatcher.unref === "function") {
+      this.accountWatcher.unref();
+    }
+    return this.accountWatcher;
+  }
+
+  stopAccountWatcher() {
+    if (this.accountWatcher) {
+      clearInterval(this.accountWatcher);
+      this.accountWatcher = null;
+    }
   }
 
   get activeAccount() {
@@ -2445,6 +2601,13 @@ export function startVeniceOpenAiProxyServer({
     server.once("error", reject);
     server.listen(port, host, async () => {
       server.off("error", reject);
+      // A new session file joins the pool on the next poll; no restart needed.
+      const watcher = proxy.watchAccounts(ACCOUNT_REFRESH_MS);
+      if (watcher) {
+        console.log(
+          `[${nowIso()}] watching for account changes every ${ACCOUNT_REFRESH_MS}ms (set VENICE_ACCOUNT_REFRESH_MS=0 to disable)`,
+        );
+      }
       // Warm the sampling defaults so the first chat completion already matches
       // the web UI; a failure here must not keep the proxy from serving.
       try {
@@ -2458,6 +2621,7 @@ export function startVeniceOpenAiProxyServer({
       }
       resolve({ server, proxy, host, port });
     });
+    server.on("close", () => proxy.stopAccountWatcher());
   });
 }
 

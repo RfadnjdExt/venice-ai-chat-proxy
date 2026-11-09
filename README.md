@@ -224,9 +224,15 @@ one of these:
 - a `.venice-web-session*.json` sibling of the configured `VENICE_SESSION_FILE` (this is
   what makes a `/data` volume work in Docker)
 
-Restart the proxy after adding a file: accounts are discovered at startup, then requests
-round-robin across them and fail over to the next account on HTTP 429. `/support/info`
-lists the loaded accounts with their file, email and rate-limit state.
+The proxy rescans those locations every `VENICE_ACCOUNT_REFRESH_MS` (default `3000`
+milliseconds), so adding or deleting a session file changes a **running** pool without a
+restart. Only complete files are added — valid JSON with a `sessionId` or `clerkJwt` — so a
+login that is still writing its file joins on a later scan instead of failing. Accounts that
+stay keep their cached auth, and the round-robin position is preserved when the pool is
+rebuilt. Set `VENICE_ACCOUNT_REFRESH_MS=0` to disable the scan.
+
+Requests round-robin across the accounts and fail over to the next one on HTTP 429.
+`/support/info` lists the loaded accounts with their file, email and rate-limit state.
 
 Give each Google account its own browser profile. A persistent profile keeps one Google
 login, so a second `--google` run in the same profile would capture the first account
@@ -698,6 +704,7 @@ Container behavior at startup:
 - tries to restore `/data/.venice-web-session.json`
 - if needed, logs in using the browserless `wreq-js` Clerk flow with `VENICE_EMAIL` and `VENICE_PASSWORD`
 - persists the refreshed session
+- rescans `/data` for added or removed account files every `VENICE_ACCOUNT_REFRESH_MS` (default 3000 ms), so a new session file joins without a restart
 - starts the proxy and keeps it running
 
 The Docker image defaults to:
