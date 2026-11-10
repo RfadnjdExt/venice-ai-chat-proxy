@@ -234,6 +234,12 @@ rebuilt. Set `VENICE_ACCOUNT_REFRESH_MS=0` to disable the scan.
 Requests round-robin across the accounts and fail over to the next one on HTTP 429.
 `/support/info` lists the loaded accounts with their file, email and rate-limit state.
 
+When **every** account is already rate limited, the proxy fails fast instead of retrying:
+it answers `HTTP 400` with `error.code = "all_accounts_rate_limited"`, the earliest
+`error.reset_at`, a `retry-after` header, and `x-should-retry: false`. A 400 is not retried
+by OpenAI-compatible clients (429 and 5xx are), so a spent quota does not turn into a
+retry storm.
+
 Give each Google account its own browser profile. A persistent profile keeps one Google
 login, so a second `--google` run in the same profile would capture the first account
 again (auto-detection would then just refresh the first account's file, not add one):

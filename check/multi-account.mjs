@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createVeniceOpenAiProxy, discoverSessionFiles, isRateLimitError, parseAccountRefreshInterval, parseRateLimitCooldown, VeniceAccount } from "../src/proxy.mjs";
+import { AllAccountsRateLimitedError, createVeniceOpenAiProxy, createVeniceOpenAiProxyServer, discoverSessionFiles, isRateLimitError, parseAccountRefreshInterval, parseRateLimitCooldown, VeniceAccount } from "../src/proxy.mjs";
 
 let passed = 0;
 let failed = 0;
@@ -107,6 +107,8 @@ async function testPoolRotationAndFailover() {
   }
   ok("throws when all accounts are rate-limited", caught && isRateLimitError(caught));
   ok("error message notes all accounts exceeded", caught?.message?.includes("all 2 accounts"));
+  ok("all-limited error is a dedicated non-retryable error",
+    caught instanceof AllAccountsRateLimitedError && caught.status === 400 && caught.retryable === false);
 }
 
 async function testAccountHotReload() {
@@ -224,6 +226,50 @@ async function testAccountHotReload() {
   }
 }
 
+async function testAllLimitedResponse() {
+  section("All accounts limited is non-retryable over HTTP");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "venice-all-limited-"));
+  const sessionFile = path.join(dir, ".venice-web-session.json");
+  fs.writeFileSync(sessionFile, JSON.stringify({ sessionId: "limited" }));
+
+  const proxy = createVeniceOpenAiProxy([sessionFile]);
+  proxy.accounts[0].rateLimitedUntil = Date.now() + 30 * 60 * 1000;
+  const server = createVeniceOpenAiProxyServer(proxy);
+
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "deepseek-v4-1-flash-uncensored",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      },
+    );
+    const body = await response.json();
+    ok("all-limited request answers HTTP 400", response.status === 400);
+    ok("all-limited response says x-should-retry: false",
+      response.headers.get("x-should-retry") === "false");
+    ok("all-limited response sends retry-after",
+      Number(response.headers.get("retry-after")) > 0);
+    ok("all-limited body carries the code",
+      body?.error?.code === "all_accounts_rate_limited");
+    ok("all-limited body carries the reset time",
+      typeof body?.error?.reset_at === "string");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 function testSessionDiscovery() {
   section("Session file discovery");
 
@@ -279,6 +325,7 @@ async function main() {
   testRateLimitHelper();
   await testPoolRotationAndFailover();
   await testAccountHotReload();
+  await testAllLimitedResponse();
   testSessionDiscovery();
 
   console.log(`\n────────────────────────────────────────\nResults: ${passed} passed, ${failed} failed\n`);

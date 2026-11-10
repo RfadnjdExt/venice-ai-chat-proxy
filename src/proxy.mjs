@@ -406,6 +406,31 @@ export function parseRateLimitCooldown(error) {
   return Date.now() + DEFAULT_COOLDOWN_MS;
 }
 
+// Thrown when every account is rate limited. The proxy answers HTTP 400 (not
+// 429) so OpenAI-compatible clients stop retrying: most retry 429/408/409/5xx
+// automatically, but not 400. The body keeps a machine-readable code and the
+// earliest reset time.
+export class AllAccountsRateLimitedError extends Error {
+  constructor(message, resetAt = null) {
+    super(message);
+    this.name = "AllAccountsRateLimitedError";
+    this.status = 400;
+    this.code = "all_accounts_rate_limited";
+    this.rateLimitedUntil = Number.isFinite(resetAt) ? resetAt : null;
+  }
+
+  get retryable() {
+    return false;
+  }
+
+  get retryAfterSeconds() {
+    if (!this.rateLimitedUntil) {
+      return null;
+    }
+    return Math.max(1, Math.ceil((this.rateLimitedUntil - Date.now()) / 1000));
+  }
+}
+
 // `VENICE_ACCOUNT_REFRESH_MS` is the poll interval for picking up added or
 // removed session files. Empty/unset uses the default; "off"/"0"/"false"/"no"
 // disables the scan; anything else non-numeric falls back to the default.
@@ -1377,6 +1402,20 @@ export class VeniceOpenAiProxy {
     };
   }
 
+  buildAllAccountsRateLimitedError() {
+    const total = this.accounts.length;
+    const earliestReset = Math.max(
+      Date.now(),
+      Math.min(...this.accounts.map((acc) => acc.rateLimitedUntil || 0)),
+    );
+    const waitMinutes = Math.max(1, Math.ceil((earliestReset - Date.now()) / 60000));
+    const resetIso = new Date(earliestReset).toISOString();
+    return new AllAccountsRateLimitedError(
+      `HTTP 429: Rate limit exceeded on all ${total} accounts. Earliest reset at ${resetIso} (~${waitMinutes}m).`,
+      earliestReset,
+    );
+  }
+
   // Runs an upstream call with a cached JWT, retrying once on 401 and rotating to
   // the next available account on 429 rate limits.
   async callWithAuth(operation, { label, model }) {
@@ -1387,12 +1426,7 @@ export class VeniceOpenAiProxy {
     while (accountsAttempted < totalAccounts) {
       const account = this.getNextAccount();
       if (!account) {
-        const earliestReset = Math.min(...this.accounts.map((a) => a.rateLimitedUntil));
-        const waitMinutes = Math.max(1, Math.ceil((earliestReset - Date.now()) / 60000));
-        const resetIso = new Date(earliestReset).toISOString();
-        throw new Error(
-          `HTTP 429: Rate limit exceeded on all ${totalAccounts} accounts. Earliest reset at ${resetIso} (~${waitMinutes}m).`,
-        );
+        throw this.buildAllAccountsRateLimitedError();
       }
 
       accountsAttempted += 1;
@@ -1440,6 +1474,9 @@ export class VeniceOpenAiProxy {
       }
     }
 
+    if (isRateLimitError(lastError)) {
+      throw this.buildAllAccountsRateLimitedError();
+    }
     throw lastError || new Error("All accounts failed.");
   }
 
@@ -2561,6 +2598,27 @@ export function createVeniceOpenAiProxyServer(
         console.warn(`[${nowIso()}] context overflow: ${error instanceof Error ? error.message : String(error)}`);
         json(res, overflow.status, overflow.body);
         logOutgoingResponse({ req, url, status: overflow.status, durationMs: Date.now() - startedAt });
+        return;
+      }
+      if (error instanceof AllAccountsRateLimitedError) {
+        const retryAfterSeconds = error.retryAfterSeconds;
+        res.setHeader("x-should-retry", "false");
+        if (retryAfterSeconds) {
+          res.setHeader("retry-after", String(retryAfterSeconds));
+        }
+        json(res, 400, {
+          error: {
+            message:
+              "Venice rate limit exceeded on all accounts (free quota reached). Not retrying; wait for the quota to reset.",
+            type: "invalid_request_error",
+            code: "all_accounts_rate_limited",
+            reset_at: error.rateLimitedUntil
+              ? new Date(error.rateLimitedUntil).toISOString()
+              : null,
+            retry_after_seconds: retryAfterSeconds,
+          },
+        });
+        logOutgoingResponse({ req, url, status: 400, durationMs: Date.now() - startedAt });
         return;
       }
       const errStr = error instanceof Error ? error.message : String(error);
