@@ -57,6 +57,19 @@ const TOOL_REASONING_BUDGET = parseReasoningBudget(process.env.VENICE_TOOL_REASO
 const LARGE_CONTEXT_ENABLED = !["off", "0", "false", "no"].includes(
   process.env.VENICE_LARGE_CONTEXT?.trim().toLowerCase() ?? "",
 );
+// Venice refuses an over-long prompt with HTTP 413 userPromptTooLong. Clients
+// usually answer that by compacting, but a client can also get stuck: opencode's
+// compactor gives up ("cannot be reduced further") when one serialized
+// checkpoint message is already too big, and nothing ever shrinks the prompt.
+// As a safety net the same request is retried with the oldest part of the prompt
+// dropped, at these fractions of the original text. Set VENICE_CONTEXT_TRIM=off
+// to pass the 413 through untouched.
+const CONTEXT_TRIM_RATIOS = [0.75, 0.5, 0.35];
+const CONTEXT_TRIM_ENABLED = !["off", "0", "false", "no"].includes(
+  process.env.VENICE_CONTEXT_TRIM?.trim().toLowerCase() ?? "",
+);
+const CONTEXT_TRIM_MARKER =
+  "\n\n[…older context removed by the proxy: Venice rejected the prompt as too long…]\n\n";
 // Forced off (with includeVeniceSystemPrompt) whenever tools are emulated.
 const TOOL_EMULATION_DISABLED_FEATURES = ["webEnabled", "webScrapeEnabled", "xSearchEnabled"];
 if (TOOL_FORMAT_RULES.invalid.length > 0) {
@@ -567,6 +580,63 @@ async function retryModelOverloaded(operation, { label, model }) {
       }
     }
   }
+}
+
+// Keeps the head and the tail of a text: a compaction prompt puts the summary
+// first and the latest exchange last, so the middle is the safest part to lose.
+function truncateMiddle(text, maxChars) {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  if (maxChars <= CONTEXT_TRIM_MARKER.length) {
+    return text.slice(text.length - maxChars);
+  }
+  const room = maxChars - CONTEXT_TRIM_MARKER.length;
+  const head = Math.floor(room * 0.25);
+  return text.slice(0, head) + CONTEXT_TRIM_MARKER + text.slice(text.length - (room - head));
+}
+
+// Drops the oldest non-system messages until the prompt is down to `ratio` of
+// its original text, then cuts the middle out of the last message if that one
+// alone is still too big. Returns null when there is nothing left to trim.
+export function trimMessagesForOverflow(messages, ratio) {
+  const list = Array.isArray(messages) ? messages : [];
+  const lengths = list.map((message) => normalizeOpenAiContent(message?.content).length);
+  const totalChars = lengths.reduce((sum, length) => sum + length, 0);
+  const systemChars = list.reduce(
+    (sum, message, index) => (message?.role === "system" ? sum + lengths[index] : sum),
+    0,
+  );
+  const target = Math.floor(totalChars * ratio) - systemChars;
+  if (target <= 0 || totalChars - systemChars <= 0) {
+    return null;
+  }
+
+  const kept = list.map((message) => ({ ...message }));
+  const trimmable = list
+    .map((message, index) => (message?.role === "system" ? -1 : index))
+    .filter((index) => index >= 0);
+  let chars = trimmable.reduce((sum, index) => sum + lengths[index], 0);
+  // Always keep the newest message: it holds the question being answered.
+  for (let dropped = 0; dropped < trimmable.length - 1 && chars > target; dropped += 1) {
+    chars -= lengths[trimmable[dropped]];
+    kept[trimmable[dropped]] = null;
+  }
+
+  const trimmed = kept.filter(Boolean);
+  if (chars > target) {
+    const last = trimmed.findLastIndex((message) => message?.role !== "system");
+    if (last < 0) {
+      return null;
+    }
+    const text = normalizeOpenAiContent(trimmed[last].content);
+    const room = text.length - (chars - target);
+    if (room <= 0) {
+      return null;
+    }
+    trimmed[last] = { ...trimmed[last], content: truncateMiddle(text, room) };
+  }
+  return trimmed;
 }
 
 function splitMessages(messages) {
@@ -1591,57 +1661,95 @@ export class VeniceOpenAiProxy {
     return data;
   }
 
-  async chatCompletions(payload) {
-    const { prompt, systemPrompt } = splitMessages(payload.messages);
-    if (prompt.length === 0) {
-      throw new Error("No usable prompt messages found.");
+  // A 413 userPromptTooLong is not retryable as-is, but it is recoverable by
+  // sending less. Retry the same request with the oldest prompt text dropped.
+  async retryTrimmedOnOverflow(messages, label, run) {
+    try {
+      return await run(messages);
+    } catch (error) {
+      if (!CONTEXT_TRIM_ENABLED || !contextOverflowError(error)) {
+        throw error;
+      }
+      const messageCount = Array.isArray(messages) ? messages.length : 0;
+      let lastError = error;
+      for (const ratio of CONTEXT_TRIM_RATIOS) {
+        const trimmed = trimMessagesForOverflow(messages, ratio);
+        if (!trimmed) {
+          break;
+        }
+        try {
+          const result = await run(trimmed);
+          console.warn(
+            `[${nowIso()}] ${label}: Venice rejected the prompt as too long; retried with ${trimmed.length}/${messageCount} message(s), text trimmed to ~${Math.round(ratio * 100)}%`,
+          );
+          return result;
+        } catch (retryError) {
+          if (!contextOverflowError(retryError)) {
+            throw retryError;
+          }
+          lastError = retryError;
+        }
+      }
+      throw lastError;
     }
+  }
 
+  async chatCompletions(payload) {
     const model = payload.model || this.client.model;
-    return await this.callWithAuth(
-      async (auth, attempt, account) => {
-        const requestId = Math.random().toString(36).slice(2, 9);
-        const options = buildVeniceChatOptions({
-          payload,
-          model,
-          prompt,
-          systemPrompt,
-          requestId,
-          resolveModelSettings: (id) => this.getModelSettings(id),
-        });
-        const targetClient = account?.client ?? this.client;
-        const result = await targetClient.chat(auth.login.clerkJwt, undefined, options);
-        return { ...result, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
-      },
-      { label: "chat completion", model },
-    );
+    return await this.retryTrimmedOnOverflow(payload.messages, "chat completion", async (messages) => {
+      const { prompt, systemPrompt } = splitMessages(messages);
+      if (prompt.length === 0) {
+        throw new Error("No usable prompt messages found.");
+      }
+
+      return await this.callWithAuth(
+        async (auth, attempt, account) => {
+          const requestId = Math.random().toString(36).slice(2, 9);
+          const options = buildVeniceChatOptions({
+            payload,
+            model,
+            prompt,
+            systemPrompt,
+            requestId,
+            resolveModelSettings: (id) => this.getModelSettings(id),
+          });
+          const targetClient = account?.client ?? this.client;
+          const result = await targetClient.chat(auth.login.clerkJwt, undefined, options);
+          return { ...result, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
+        },
+        { label: "chat completion", model },
+      );
+    });
   }
 
   async openChatCompletionStream(payload, toolEmulation = null) {
-    const { prompt, systemPrompt } = splitMessages(toolEmulation?.messages ?? payload.messages);
-    if (prompt.length === 0) {
-      throw new Error("No usable prompt messages found.");
-    }
-
     const model = payload.model || this.client.model;
-    return await this.callWithAuth(
-      async (auth, attempt, account) => {
-        const requestId = Math.random().toString(36).slice(2, 9);
-        const options = buildVeniceChatOptions({
-          payload,
-          model,
-          prompt,
-          systemPrompt,
-          requestId,
-          resolveModelSettings: (id) => this.getModelSettings(id),
-          toolEmulation,
-        });
-        const targetClient = account?.client ?? this.client;
-        const stream = await targetClient.openChatStream(auth.login.clerkJwt, undefined, options);
-        return { ...stream, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
-      },
-      { label: "chat completion stream", model },
-    );
+    const sourceMessages = toolEmulation?.messages ?? payload.messages;
+    return await this.retryTrimmedOnOverflow(sourceMessages, "chat completion stream", async (messages) => {
+      const { prompt, systemPrompt } = splitMessages(messages);
+      if (prompt.length === 0) {
+        throw new Error("No usable prompt messages found.");
+      }
+
+      return await this.callWithAuth(
+        async (auth, attempt, account) => {
+          const requestId = Math.random().toString(36).slice(2, 9);
+          const options = buildVeniceChatOptions({
+            payload,
+            model,
+            prompt,
+            systemPrompt,
+            requestId,
+            resolveModelSettings: (id) => this.getModelSettings(id),
+            toolEmulation,
+          });
+          const targetClient = account?.client ?? this.client;
+          const stream = await targetClient.openChatStream(auth.login.clerkJwt, undefined, options);
+          return { ...stream, promptTokens: estimatePromptTokens(options.promptMessages, options.systemPrompt) };
+        },
+        { label: "chat completion stream", model },
+      );
+    });
   }
 }
 

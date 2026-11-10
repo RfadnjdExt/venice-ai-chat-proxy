@@ -322,20 +322,21 @@ If the catalog can't be fetched at startup the proxy logs a warning and still se
 
 Venice's chat endpoint can refuse a long conversation with `HTTP 413 {"error":"userPromptTooLong"}` (seen with an opencode session of about 820 KB on GLM 5.2). What exactly triggers it is not known yet: in a live test on 2026-11-05 the endpoint accepted a single ~200K-token message (1.2 MB) on GLM 5.2 and a ~60K-token one on `qwen3-coder-480b-a35b-instruct-turbo`, so it is not a plain 50K-token cap.
 
-Observed on 2026-11-10 with `deepseek-v4-1-flash-uncensored`: a compaction request the proxy estimated at 113K prompt tokens was accepted, while the next normal request (same history plus the agent system prompt and tool schemas) was rejected. A client limit of 131072 therefore compacts too late and then cannot shrink enough. For that model, keep `limit.context` at **100000 or lower** so the client compacts before it reaches the cap.
+Observed on 2026-11-10 with `deepseek-v4-1-flash-uncensored`: the same checkpoint prompt was accepted at 69K characters (system prompt included) and rejected at 108K, at an estimated 20K vs 31K prompt tokens and with every other account answering identically. Earlier the same model took a 113K-token compaction request, so the limit is not a plain token count and cannot be pinned down from the outside. Treat the numbers above as the practical ceiling for a full agent prompt (system prompt + tool schemas + history).
 
 What the proxy does about it:
 
 - **Estimated usage.** Venice reports no token counts, so the proxy estimates them (UTF-8 bytes / 3.5) and returns `usage` on every `/v1/chat/completions` response: in the JSON body, or on the final `choices: []` chunk of a stream. `prompt_tokens` counts what is actually sent to Venice, including the tool prompt; `completion_tokens` counts answer text plus reasoning. Clients such as opencode use it to decide when to compact a conversation. The estimate errs high: about 1.75× the real count for plain English prose, closer for code and JSON, so clients compact early rather than late. The translate log shows `est_prompt_tokens=N`.
 - **Overflow as a 400.** A 413 `userPromptTooLong` / `userMessageTooLong` from Venice comes back as HTTP 400 with `code: "context_length_exceeded"` and a message starting `prompt is too long`, the shape OpenAI-compatible clients treat as a context overflow (opencode then compacts and retries) instead of a server error.
+- **Overflow retry with a trimmed prompt.** A client compactor can also get stuck: opencode refuses to drop the last exchange and answers "The compaction request cannot be reduced further". Because a 413 means "send less", the proxy retries the same request with the oldest part of the prompt removed — first dropping the oldest turns, then cutting the middle out of a single oversized message (the head and the newest tail survive) with a marker where the text was removed. It tries 75%, 50% and 35% of the original text, then gives up and returns the 400 above. The trim is logged as `retried with N/M message(s), text trimmed to ~50%`. Set `VENICE_CONTEXT_TRIM=off` to pass the 413 through untouched.
 - **Large context opt-in.** Like the web app, the chat request carries `enableLargeContextChat: true` for a model the catalog marks as `largeContextChatEligible` (at the time of writing GLM 5.2 and `qwen-3-8-27b`) and that does not bill credits (`usesCredits`); the translate log shows `large_context=on`. Without it, the web client limits a prompt to 50K or 25K tokens on its own side. `VENICE_LARGE_CONTEXT=off` stops sending it.
 
-Clients still need a context limit to compact against. In opencode, give each model a `limit`, for example:
+Clients still need a context limit to compact against. In opencode, give each model a `limit`, for example (the values advertise most of the model's real window; the overflow retry above covers what Venice refuses before the client compacts):
 
 ```json
 "zai-org-glm-5-2": { "limit": { "context": 200000, "output": 32768 } },
 "qwen3-coder-480b-a35b-instruct-turbo": { "limit": { "context": 120000, "output": 8192 } },
-"deepseek-v4-1-flash-uncensored": { "limit": { "context": 100000, "output": 8192 } }
+"deepseek-v4-1-flash-uncensored": { "limit": { "context": 131072, "output": 8192 } }
 ```
 
 ### HTTP transport

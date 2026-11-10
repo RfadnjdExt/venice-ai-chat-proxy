@@ -31,6 +31,15 @@ async function main() {
     return { events: [{ kind: "content", content: "ok" }], text: "ok" };
   };
 
+  // Each account owns a client of its own; point them all at the stub above so
+  // rotation between accounts never reaches the network.
+  for (const account of proxy.accounts) {
+    account.client = proxy.client;
+    account.requestCount = 0;
+    account.rateLimitedUntil = 0;
+  }
+  proxy.accountIndex = 0;
+
   const server = createVeniceOpenAiProxyServer(proxy);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${server.address().port}/v1`;

@@ -1,5 +1,6 @@
 import { pathToFileURL } from "node:url";
 import { createVeniceOpenAiProxy, createVeniceOpenAiProxyServer } from "../src/proxy.mjs";
+import { AgenticProxy } from "../src/agentic.mjs";
 import { NULL_BYTE_REPLACEMENT, replaceNullBytes } from "../src/venice-text.mjs";
 
 // Offline check: no null byte from a client message reaches Venice, on any
@@ -65,6 +66,16 @@ async function testProxy() {
   };
   proxy.client.openAgentChatStream = async (_jwt, messages) => agentStream(messages);
   proxy.client.openWorkflowChatStream = async (_jwt, messages) => agentStream(messages);
+
+  // Each account owns a client of its own; point them all at the stubs above so
+  // rotation between accounts never reaches the network.
+  for (const account of proxy.accounts) {
+    account.client = proxy.client;
+    account.agentic = new AgenticProxy(proxy.client);
+    account.requestCount = 0;
+    account.rateLimitedUntil = 0;
+  }
+  proxy.accountIndex = 0;
 
   const server = createVeniceOpenAiProxyServer(proxy);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
